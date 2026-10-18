@@ -234,6 +234,14 @@ struct GenerationArgs {
     #[arg(long, value_enum)]
     sampler: Option<Sampler>,
 
+    /// Video timestep shift (base default: 12). Few-step adapters are trained at 6.
+    #[arg(long, value_name = "SHIFT", value_parser = shift_value)]
+    video_shift: Option<f64>,
+
+    /// Audio timestep shift (base default: 3). Few-step adapters are trained at 3.
+    #[arg(long, value_name = "SHIFT", value_parser = shift_value)]
+    audio_shift: Option<f64>,
+
     /// Use only checkpoints already on disk; never download
     #[arg(long)]
     offline: bool,
@@ -468,9 +476,25 @@ fn memory_budget_bytes(cli: &Cli) -> Result<Option<usize>> {
     Ok(Some(bytes))
 }
 
+/// A timestep shift must be finite and positive; the engine treats `<= 0` as "use the default",
+/// which would silently ignore a mistyped value, so the CLI refuses it instead.
+fn shift_value(text: &str) -> std::result::Result<f64, String> {
+    let value: f64 = text
+        .parse()
+        .map_err(|_| format!("`{text}` is not a number"))?;
+    if value.is_finite() && value > 0.0 {
+        Ok(value)
+    } else {
+        Err(format!(
+            "shift must be finite and greater than zero, got {text}"
+        ))
+    }
+}
+
 fn parameters(cli: &Cli) -> Result<DenoiseParams> {
     memory_budget_bytes(cli)?;
     let cache = cache_policy(cli)?;
+    let defaults = DenoiseParams::default();
     let mut params = DenoiseParams {
         width: cli.width.unwrap_or(864),
         height: cli.height.unwrap_or(480),
@@ -481,9 +505,14 @@ fn parameters(cli: &Cli) -> Result<DenoiseParams> {
             Sampler::Euler => Sampler16::Euler,
             Sampler::ResMultistep => Sampler16::ResMultistep,
         },
-        ..DenoiseParams::default()
+        video_shift: cli.video_shift.unwrap_or(defaults.video_shift),
+        audio_shift: cli.audio_shift.unwrap_or(defaults.audio_shift),
+        ..defaults
     };
     if let Some(preset) = cli.preset.turbo() {
+        if cli.video_shift.is_some() || cli.audio_shift.is_some() {
+            usage!("Turbo presets fix the shifts at 6/3; drop --video-shift/--audio-shift");
+        }
         for (name, given, expected) in [
             ("width", cli.width, 1344),
             ("height", cli.height, 768),
@@ -549,8 +578,10 @@ fn run(mut cli: Cli) -> Result<()> {
                 || !cli.lora_strength.is_empty()
                 || cache_policy(&cli)? != h3_hrx::CachePolicy::Off
                 || cli.sampler.is_some_and(|s| s != Sampler::Euler)
+                || cli.video_shift.is_some()
+                || cli.audio_shift.is_some()
             {
-                usage!("world supports one first frame and its released adapter, without references, Turbo, adapter composition or step caching");
+                usage!("world supports one first frame and its released adapter, without references, Turbo, adapter composition, step caching or custom shifts");
             }
             cli.width = Some(cli.width.unwrap_or(832));
             cli.height = Some(cli.height.unwrap_or(480));
@@ -1399,6 +1430,50 @@ mod tests {
             "81920",
         ]);
         assert_eq!(memory_budget_bytes(&cli).unwrap(), Some(80 << 30));
+    }
+
+    #[test]
+    fn shift_flags_default_to_the_engine_and_override_when_given() {
+        let base = DenoiseParams::default();
+        let cli = Cli::try_parse_from(["h3"]).unwrap();
+        let p = parameters(&cli).unwrap();
+        assert_eq!(
+            (p.video_shift, p.audio_shift),
+            (base.video_shift, base.audio_shift)
+        );
+
+        let cli = Cli::try_parse_from(["h3", "--video-shift", "6", "--audio-shift", "3"]).unwrap();
+        let p = parameters(&cli).unwrap();
+        assert_eq!((p.video_shift, p.audio_shift), (6.0, 3.0));
+
+        // Either flag alone leaves the other at the engine default.
+        let cli = Cli::try_parse_from(["h3", "--video-shift", "6"]).unwrap();
+        let p = parameters(&cli).unwrap();
+        assert_eq!((p.video_shift, p.audio_shift), (6.0, base.audio_shift));
+    }
+
+    #[test]
+    fn shift_flags_reject_values_the_engine_would_silently_replace() {
+        for bad in ["0", "-1", "NaN", "inf", "six", ""] {
+            assert!(
+                Cli::try_parse_from(["h3", "--video-shift", bad]).is_err(),
+                "{bad}"
+            );
+            assert!(
+                Cli::try_parse_from(["h3", "--audio-shift", bad]).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn turbo_presets_refuse_custom_shifts() {
+        let cli =
+            Cli::try_parse_from(["h3", "--preset", "turbo-768p-8", "--video-shift", "7"]).unwrap();
+        assert!(parameters(&cli).is_err());
+        let cli = Cli::try_parse_from(["h3", "--preset", "turbo-768p-8"]).unwrap();
+        let p = parameters(&cli).unwrap();
+        assert_eq!((p.video_shift, p.audio_shift), (6.0, 3.0));
     }
 
     #[test]
