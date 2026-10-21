@@ -11,7 +11,7 @@ use crate::dispatch::{axpy, checked, Classes, Matmul16, NormMod, Profile};
 use crate::error::{invalid, Result};
 use crate::model::*;
 use crate::rope::VisionSpan;
-use crate::stack::{Constants, Stack, StackDims};
+use crate::stack::{Constants, MixedStack, StackDims};
 use crate::te::{Span, TextEncoder};
 use crate::weights::Weights;
 
@@ -30,7 +30,8 @@ fn wait_for_step(stream: &mut hrx::Stream) -> Result<()> {
     Ok(())
 }
 
-/// The refiner: two H3-shaped blocks on bf16 rows with no rope, then a modulated norm.
+/// The refiner: two H3-shaped blocks with no rope, then a modulated norm.
+/// MixedStack selects the weight precision from each block's recipes.
 fn refiner_dims() -> StackDims {
     StackDims {
         hidden: HID,
@@ -79,7 +80,7 @@ struct Seq {
 }
 
 struct Refiner {
-    stack: Stack,
+    stack: MixedStack,
     tokens: usize,
     cos: hrx::Buffer,
     sin: hrx::Buffer,
@@ -200,7 +201,7 @@ impl Dit {
             return Ok(());
         }
         self.refiner = None;
-        let mut stack = Stack::new(
+        let mut stack = MixedStack::new(
             c,
             stream,
             refiner_dims(),
@@ -414,7 +415,7 @@ struct Conditioning {
 
 /// The 50-block stack and the buffers that depend on the sequence length.
 struct Blocks {
-    stack: Stack,
+    stack: MixedStack,
     tokens: usize,
     qk_bits: usize,
     final_norm: NormMod,
@@ -758,7 +759,7 @@ impl Dit {
             bf16: false,
         };
         let qk = d.attn_qk_bits;
-        let mut stack = Stack::new(
+        let mut stack = MixedStack::new(
             c,
             stream,
             d,

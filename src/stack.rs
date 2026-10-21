@@ -14,6 +14,8 @@ use std::sync::{Arc, OnceLock};
 
 #[path = "stack_adapter.rs"]
 mod adapter;
+mod mixed;
+pub(crate) use mixed::MixedStack;
 
 pub type Result<T> = std::result::Result<T, crate::compile::Error>;
 
@@ -158,6 +160,8 @@ pub struct Stack {
     tokens: usize,
     capacity: usize,
     layers: usize,
+    /// Global block index when this stack is one precision run of a mixed model.
+    layer_offset: usize,
     tag: String,
     waves: usize,
     calls: usize,
@@ -801,6 +805,7 @@ impl Stack {
             tokens,
             capacity,
             layers,
+            layer_offset: 0,
             tag: tag.into(),
             waves,
             calls: 0,
@@ -1039,7 +1044,7 @@ impl Stack {
         let dump_dir = env_once("H3_DUMP_BLOCKS");
         let (cap, rows) = (self.capacity, self.tokens);
         let (q, k, v) = self.qkv_views();
-        if dumping {
+        if dumping && self.layer_offset == 0 {
             if let Sink::Stream(stream) = &mut *sink {
                 self.dump(stream, dump_dir.unwrap(), "h_in", x)?;
             }
@@ -1318,7 +1323,12 @@ impl Stack {
             }
             if dumping {
                 if let Sink::Stream(stream) = &mut *sink {
-                    self.dump(stream, dump_dir.unwrap(), &format!("blk_{i:02}"), x)?;
+                    self.dump(
+                        stream,
+                        dump_dir.unwrap(),
+                        &format!("blk_{:02}", self.layer_offset + i),
+                        x,
+                    )?;
                 }
             }
         }

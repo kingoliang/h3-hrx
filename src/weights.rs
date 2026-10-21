@@ -1,11 +1,12 @@
 //! Turning a checkpoint's tensors into the exact byte layout each kernel reads.
 //!
-//! A recipe is layout only, bit for bit: rows concatenated, rows interleaved, rows permuted, zero
-//! padding, and lossless widening of small float vectors to the f32 the CPU-side maths takes. Nothing
-//! here rotates or quantises — the checkpoint's dtypes are what the kernels run.
+//! Most recipes are layout only: rows concatenated, interleaved or permuted, zero
+//! padding, and lossless widening of small float vectors to f32. Nothing
+//! in the generic layout helpers rotates or quantises. Model-specific built recipes
+//! may restore quantized small projections to the floating-point kernel layout.
 //!
 //! Recipes are declarative and resolved against the checkpoint when they are assembled, so a recipe
-//! table can be built and validated at open without reading a byte of tensor data.
+//! table can be built and validated at open without reading matrix payloads.
 mod native;
 use crate::checkpoint::Checkpoint;
 use half::{bf16, f16};
@@ -494,7 +495,7 @@ pub fn elem_bytes(dtype: Dtype) -> usize {
 }
 
 /// One float element widened to f32. F32 passes through; F16 and BF16 widen exactly.
-fn widen_one(dtype: Dtype, bytes: &[u8]) -> Result<f32> {
+pub(crate) fn widen_one(dtype: Dtype, bytes: &[u8]) -> Result<f32> {
     Ok(match dtype {
         Dtype::F32 => f32::from_le_bytes(bytes[..4].try_into().unwrap()),
         Dtype::F16 => f16::from_le_bytes(bytes[..2].try_into().unwrap()).to_f32(),

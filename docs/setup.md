@@ -71,6 +71,22 @@ then `$HF_HOME/hub`, then `$XDG_CACHE_HOME/huggingface/hub`.
 Use `--dit`, `--te`, `--video-vae` or `--audio-vae` for explicit file paths.
 Model weights have separate license terms.
 
+Custom H3 merges can mix BF16 and INT8 ConvRot transformer blocks, including
+INT8 token refiners and condition/output projections. Each block's four matrices
+must share a dtype; INT8 matrices require per-row FP32 scales and ConvRot group
+size 256. BF16/F16/FP32 embedding weights, biases and normalization vectors are
+accepted. The small condition/output projections are dequantized and unrotated
+when loaded; transformer blocks run in their stored precision.
+
+For example, use a local merged checkpoint with the cached text encoder and VAEs:
+
+```sh
+cargo run --locked --release --bin h3 -- \
+  --dit ~/h3_b6_int8.safetensors --offline \
+  --width 512 --height 288 --frames 22 --steps 21 \
+  --out clip.mp4 < prompt.txt
+```
+
 Reference requests select Ref2VA; text and keyframe-only requests select FL2VA.
 `--base-weights` forces FL2VA with references. To prefetch files with the optional
 Hugging Face CLI:

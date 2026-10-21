@@ -114,6 +114,7 @@ impl AdapterRuntime {
             };
             let specs = (0..stack.layers)
                 .map(|layer| {
+                    let layer = stack.layer_offset + layer;
                     let prefix = format!("diffusion_model.{group}.{layer}.{op}");
                     adapter
                         .projections
