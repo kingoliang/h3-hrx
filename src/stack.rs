@@ -1786,7 +1786,10 @@ impl Stack {
                 self.transpose.as_ref().expect("built with integer QK"),
                 Some(prof),
                 "attention operands",
-                &[t],
+                // The plain transpose uses 32-row tiles while head-major attention
+                // reads 64 keys. Clear the full tail when V reuses activation storage:
+                // masking a padded key cannot prevent 0 * NaN from poisoning WMMA.
+                &[if self.direct_v { t } else { cap as u32 }],
                 &[t],
                 &[v_source, self.vt_view(int_qk)],
                 &[rows * v_stride * 2, self.d.inner() * cap * 2],
