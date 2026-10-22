@@ -96,7 +96,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Noise::default(),
         &[],
         &[],
-        Some(&mut |_, _, _| Control::Cancel),
+        Some(&mut |step, _, _| {
+            if step >= 4 {
+                Control::Cancel
+            } else {
+                Control::Continue
+            }
+        }),
     );
     assert!(matches!(error, Err(h3_hrx::Error::Cancelled)));
     let changed = DenoiseParams {

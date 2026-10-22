@@ -260,6 +260,36 @@ impl Runtime {
             &[self.scores_buf.binding(), self.routes.binding()],
             &[self.heads * b * b * 4, self.heads * b * b * 4],
         )?;
+        #[cfg(test)]
+        if block == 0 && std::env::var_os("H3_VSA_DIAGNOSTICS").is_some() {
+            if let Sink::Stream(stream) = sink {
+                for (name, buf) in [("q_means", &self.qm), ("k_means", &self.km)] {
+                    let mut values = vec![0f32; b * w];
+                    stream.read_blocking(buf.binding(), bytemuck::cast_slice_mut(&mut values))?;
+                    assert!(values.iter().all(|v| v.is_finite()), "non-finite {name}");
+                    eprintln!(
+                        "VSA {name}: nonfinite={} nonzero={} min={} max={}",
+                        values.iter().filter(|v| !v.is_finite()).count(),
+                        values.iter().filter(|&&v| v != 0.0).count(),
+                        values.iter().copied().fold(f32::INFINITY, f32::min),
+                        values.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+                    );
+                }
+                let mut values = vec![0i32; self.heads * b * b];
+                stream
+                    .read_blocking(self.routes.binding(), bytemuck::cast_slice_mut(&mut values))?;
+                let counts: Vec<_> = values
+                    .chunks_exact(b)
+                    .map(|row| row.iter().sum::<i32>())
+                    .collect();
+                eprintln!(
+                    "VSA routes: blocks={b} min={} max={} average={}",
+                    counts.iter().min().unwrap(),
+                    counts.iter().max().unwrap(),
+                    counts.iter().map(|&n| n as f64).sum::<f64>() / counts.len() as f64
+                );
+            }
+        }
         if let Some(i) = &self.integer {
             for (kernel, input, mean, codes, scales) in [
                 (&i.prep_q, &self.q, &i.zero, &i.qi, &i.qs),
@@ -419,6 +449,47 @@ impl Runtime {
 #[cfg(all(test, feature = "gpu-tests"))]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "full-size GPU performance diagnostic; use H3_PROFILE=device"]
+    fn full_size_profile() {
+        let mut stream = hrx::Stream::open().unwrap();
+        let c = Compiler::new(None, "");
+        let layout = crate::layout::Layout::new(9, 37, 48, 84, 207, &[], &[]).unwrap();
+        let plan = Plan::new(&layout);
+        let heads = 56;
+        let count = plan.inverse.len() * heads * 128;
+        let data: Vec<_> = (0..count)
+            .map(|i| {
+                let mut x = (i as u32).wrapping_mul(747796405).wrapping_add(2891336453);
+                x = ((x >> ((x >> 28) + 4)) ^ x).wrapping_mul(277803737);
+                x = (x >> 22) ^ x;
+                half::f16::from_f32((x as f64 / u32::MAX as f64 * 2.0 - 1.0) as f32)
+            })
+            .collect();
+        let input = stream.allocate(count * 2).unwrap();
+        stream
+            .upload(input.binding(), bytemuck::cast_slice(&data))
+            .unwrap();
+        drop(data);
+        let out = stream.allocate(count * 2).unwrap();
+        let runtime =
+            Runtime::new(&c, &mut stream, plan, &VsaOptions::default(), heads, 8, 1).unwrap();
+        let mut profile = Profile::from_env();
+        runtime
+            .emit(
+                &mut Sink::Stream(&mut stream),
+                &mut profile,
+                0,
+                input.binding(),
+                input.binding(),
+                input.binding(),
+                out.binding(),
+                None,
+            )
+            .unwrap();
+        stream.synchronize().unwrap();
+        eprintln!("{}", profile.report(0.0));
+    }
     #[test]
     fn sparse_attention_matches_independent_masked_oracle() {
         let mut stream = hrx::Stream::open().unwrap();

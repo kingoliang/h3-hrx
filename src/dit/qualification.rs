@@ -12,7 +12,7 @@ fn fasth3_matrix() -> Result<()> {
     let budget = manager.budget();
     let mut stream = hrx::Stream::open()?.with_memory_budget(budget.clone());
     let c = Compiler::new(None, "");
-    let mut prof = Profile::default();
+    let mut prof = Profile::from_env();
     let mut dit = unsafe { Dit::open(&mut stream, &path) }?;
     if mode != "dense" {
         dit.set_attention_pattern(crate::AttentionPattern::Vsa(crate::VsaOptions {
@@ -96,7 +96,7 @@ fn fasth3_matrix() -> Result<()> {
                     "step {step}/{total}: {seconds:.3}s; resident {} MiB",
                     budget.reserved_bytes() >> 20
                 );
-                if cancel {
+                if cancel && step >= 4 {
                     Control::Cancel
                 } else {
                     Control::Continue
@@ -106,7 +106,9 @@ fn fasth3_matrix() -> Result<()> {
             None,
         )
     };
-    let cases = if full {
+    let cases = if let Ok(n) = std::env::var("H3_QUALIFY_EVALUATIONS") {
+        vec![(Sampler::ResMultistep, n.parse().expect("evaluation count"))]
+    } else if full {
         vec![(Sampler::ResMultistep, 2), (Sampler::ResMultistep, 10)]
     } else {
         vec![
