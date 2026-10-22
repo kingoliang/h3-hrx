@@ -69,6 +69,18 @@ fn block(ck: &Checkpoint, out: &mut Table, src: &str, dest: &str) -> Result<()> 
             );
         }
     }
+    let gate = format!("{src}attn.to_gate_compress");
+    if ck.has(&format!("{gate}.weight")) {
+        if ck.has(&format!("{gate}.bias")) {
+            return Err(crate::weights::Error::Layout(format!(
+                "{gate}: biased compression gates are unsupported"
+            )));
+        }
+        out.insert(
+            format!("{dest}vsa_gate"),
+            projection::rows(ck, &[(&gate, INNER, HID)], true)?,
+        );
+    }
     for (target, source, len) in [
         ("norm1", "norm1.weight", HID),
         ("norm2", "norm2.weight", HID),

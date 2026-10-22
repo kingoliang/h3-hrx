@@ -4,11 +4,17 @@
 use rustler::{Atom, Binary, Encoder, Env, LocalPid, NifResult, OwnedEnv, ResourceArc};
 use std::sync::mpsc::{self, SyncSender};
 mod generate;
+mod options;
 mod atoms {
     rustler::atoms! { ok, h3_result }
 }
 enum Job {
-    Generate(LocalPid, u64, generate::GenerateRequest),
+    Generate(
+        LocalPid,
+        u64,
+        generate::GenerateRequest,
+        options::GenerateOptions,
+    ),
     Ping(LocalPid, u64),
     Encode(LocalPid, u64, Vec<f32>, usize),
 }
@@ -29,6 +35,58 @@ fn open(audio_checkpoint: Option<String>) -> NifResult<ResourceArc<Model>> {
         audio_vae: audio_checkpoint.map(Into::into),
         ..Default::default()
     };
+    open_config(config)
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn open_with_options(options: rustler::Term<'_>) -> NifResult<ResourceArc<Model>> {
+    let mut o = options::Options::new(options)?;
+    let attention = match o.get::<String>("attention")?.as_deref() {
+        None | Some("i8") => h3_hrx::Attention::I8,
+        Some("f16") => h3_hrx::Attention::F16,
+        Some("i4") => h3_hrx::Attention::I4,
+        _ => return Err(rustler::Error::BadArg),
+    };
+    let pattern_name = o.get::<String>("attention_pattern")?;
+    let keep_percent = o.get("vsa_keep_percent")?;
+    let start = o.get("vsa_start")?;
+    let end = o.get("vsa_end")?;
+    let min_tokens = o.get("vsa_min_tokens")?;
+    let dense_blocks: Option<Vec<usize>> = o.get("vsa_dense_blocks")?;
+    let attention_pattern = match pattern_name.as_deref() {
+        Some("vsa") => h3_hrx::AttentionPattern::Vsa(h3_hrx::VsaOptions {
+            keep_percent: keep_percent.unwrap_or(10.0),
+            start: start.unwrap_or(0.2),
+            end: end.unwrap_or(1.0),
+            min_tokens: min_tokens.unwrap_or(12288),
+            dense_blocks: dense_blocks.unwrap_or_default(),
+        }),
+        None | Some("dense")
+            if keep_percent.is_none()
+                && start.is_none()
+                && end.is_none()
+                && min_tokens.is_none()
+                && dense_blocks.is_none() =>
+        {
+            h3_hrx::AttentionPattern::Dense
+        }
+        _ => return Err(rustler::Error::BadArg),
+    };
+    let config = h3_hrx::Config {
+        dit: o.get::<String>("dit")?.map(Into::into),
+        te: o.get::<String>("te")?.map(Into::into),
+        video_vae: o.get::<String>("video_vae")?.map(Into::into),
+        audio_vae: o.get::<String>("audio_vae")?.map(Into::into),
+        attention,
+        attention_pattern,
+        ..Default::default()
+    };
+    o.finish()?;
+    open_config(config)
+}
+
+fn open_config(config: h3_hrx::Config) -> NifResult<ResourceArc<Model>> {
+    let explicit_checkpoint = config.dit.is_some();
     let (jobs, receiver) = mpsc::sync_channel(2);
     let (ready, opened) = mpsc::sync_channel(1);
     std::thread::Builder::new()
@@ -58,9 +116,10 @@ fn open(audio_checkpoint: Option<String>) -> NifResult<ResourceArc<Model>> {
             };
             while let Ok(job) = receiver.recv() {
                 let job = match job {
-                    Job::Generate(pid, id, request) => {
+                    Job::Generate(pid, id, request, options) => {
                         let result =
-                            generate::run(&mut session, request).map_err(|e| e.to_string());
+                            generate::run(&mut session, request, options, explicit_checkpoint)
+                                .map_err(|e| e.to_string());
                         let mut env = OwnedEnv::new();
                         let _ = env.send_and_clear(&pid, |env| {
                             let result = result.map(|out| {
@@ -161,7 +220,23 @@ fn generate(
 ) -> NifResult<Atom> {
     model
         .jobs
-        .try_send(Job::Generate(env.pid(), id, request))
+        .try_send(Job::Generate(env.pid(), id, request, Default::default()))
+        .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
+    Ok(atoms::ok())
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn generate_with_options(
+    env: Env<'_>,
+    model: ResourceArc<Model>,
+    request: generate::GenerateRequest,
+    options: rustler::Term<'_>,
+    id: u64,
+) -> NifResult<Atom> {
+    let options = options::GenerateOptions::decode(options)?;
+    model
+        .jobs
+        .try_send(Job::Generate(env.pid(), id, request, options))
         .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
     Ok(atoms::ok())
 }

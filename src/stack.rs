@@ -120,6 +120,7 @@ impl Constants {
 
 /// One layer's weights, already on the device.
 pub struct Block {
+    vsa_gate: Option<Arc<hrx::Buffer>>,
     pub qkv_q: Arc<hrx::Buffer>,
     pub qkv_s: Option<Arc<hrx::Buffer>>,
     pub out_q: Arc<hrx::Buffer>,
@@ -153,6 +154,8 @@ pub fn env_once(name: &'static str) -> Option<&'static str> {
             .map(|v| &*Box::leak(v.into_boxed_str()))
     })
 }
+
+type SplitQkv = (Arc<hrx::Buffer>, Arc<hrx::Buffer>, Option<Arc<hrx::Buffer>>);
 
 pub struct Stack {
     adapter: Option<adapter::AdapterRuntime>,
@@ -189,21 +192,32 @@ pub struct Stack {
     rope: Option<crate::compile::Kernel>,
     attention: crate::compile::Kernel,
     world_attention: Option<(crate::compile::Kernel, hrx::Buffer)>,
+    vsa: Option<Arc<crate::vsa::device::Runtime>>,
+    vsa_active: bool,
+    vsa_dense_blocks: Vec<usize>,
+    vsa_gate: Option<VsaGate>,
     colmean: Option<crate::compile::Kernel>,
     prep_q: Option<crate::compile::Kernel>,
     prep_k: Option<crate::compile::Kernel>,
     transpose: Option<crate::compile::Kernel>,
 
-    a_q: hrx::Buffer,
-    a_s: hrx::Buffer,
-    fused: hrx::Buffer,
+    a_q: Arc<hrx::Buffer>,
+    a_s: Arc<hrx::Buffer>,
+    fused: Arc<hrx::Buffer>,
     /// Q/K own storage unless preparation is fused. V needs separate storage
     /// only when rotary preparation copies it out of the projection.
-    qkv_split: Option<(hrx::Buffer, hrx::Buffer, Option<hrx::Buffer>)>,
-    attn: hrx::Buffer,
-    gu: Option<hrx::Buffer>,
+    qkv_split: Option<SplitQkv>,
+    attn: Arc<hrx::Buffer>,
+    gu: Option<Arc<hrx::Buffer>>,
     /// The integer QK^T operands, when the attention runs on them.
     int_qk: Option<IntQk>,
+}
+
+struct VsaGate {
+    prepare: Prepare,
+    projection: Gemm,
+    input: hrx::Buffer,
+    output: hrx::Buffer,
 }
 
 struct CompactQkv {
@@ -213,14 +227,14 @@ struct CompactQkv {
 }
 
 struct IntQk {
-    qi: hrx::Buffer,
-    ki: hrx::Buffer,
-    qs: hrx::Buffer,
-    ks: hrx::Buffer,
-    kmean: hrx::Buffer,
-    zmean: hrx::Buffer,
+    qi: Arc<hrx::Buffer>,
+    ki: Arc<hrx::Buffer>,
+    qs: Arc<hrx::Buffer>,
+    ks: Arc<hrx::Buffer>,
+    kmean: Arc<hrx::Buffer>,
+    zmean: Arc<hrx::Buffer>,
     // None reuses the dead projection operand until attention completes.
-    vt: Option<hrx::Buffer>,
+    vt: Option<Arc<hrx::Buffer>>,
 }
 
 impl Stack {
@@ -236,6 +250,26 @@ impl Stack {
         qk_weights: bool,
         ones_head: Arc<hrx::Buffer>,
         tag: &str,
+    ) -> Result<Self> {
+        Self::build(
+            c, stream, d, tokens, layers, w, prefix, qk_weights, ones_head, tag, false, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build(
+        c: &Compiler,
+        stream: &mut hrx::Stream,
+        d: StackDims,
+        tokens: usize,
+        layers: usize,
+        w: &Weights,
+        prefix: impl Fn(usize) -> String,
+        qk_weights: bool,
+        ones_head: Arc<hrx::Buffer>,
+        tag: &str,
+        sparse: bool,
+        scratch: Option<&Stack>,
     ) -> Result<Self> {
         let elem = d.elem();
         // Text/DiT/refiner products exceed f16 range. Decoder tiles retain their f16 ABI.
@@ -312,6 +346,14 @@ impl Stack {
                 (None, None)
             };
             blocks.push(Block {
+                vsa_gate: if sparse && w.has(&format!("{p}vsa_gate")) {
+                    Some(
+                        w.at(stream, &format!("{p}vsa_gate"), d.inner() * d.hidden * 2)
+                            .map_err(|e| crate::compile::Error::Io(e.to_string()))?,
+                    )
+                } else {
+                    None
+                },
                 qkv_q: wpad(stream, &format!("{p}qkv.q"), d.qkv(), d.hidden)?,
                 qkv_s: scale(stream, &format!("{p}qkv.s"), d.qkv())?,
                 out_q: wpad(stream, &format!("{p}out.q"), d.hidden, d.inner())?,
@@ -489,7 +531,8 @@ impl Stack {
 
         // Fuse head-major INT8 operands while retaining the separate K reduction
         // when smoothing is requested. The override keeps comparisons reproducible.
-        let fused_operands = env_once("H3_FUSED_OPERANDS") != Some("0")
+        let fused_operands = !sparse
+            && env_once("H3_FUSED_OPERANDS") != Some("0")
             && !d.attn_i4
             && d.attn_qk_bits == 8
             && waves == 8
@@ -499,7 +542,8 @@ impl Stack {
             && d.heads == d.kv_heads
             && env_once("H3_KSMOOTH") != Some("1");
         let qk_int = d.attn_i4 || d.attn_qk_bits == 8;
-        let direct_v = qk_int
+        let direct_v = !sparse
+            && qk_int
             && !fused_qkv
             && !fused_operands
             && d.head_dim == 128
@@ -721,21 +765,52 @@ impl Stack {
             c.get(stream, &module, &format!("h3_{stem}"), &acfg)?
         };
 
+        // MixedStack runs execute serially, including all branches of a recorded
+        // graph. Reuse the first run's scratch when large enough; weight precision
+        // changes the projection operand size but not the common attention layout.
+        fn allocation(
+            stream: &mut hrx::Stream,
+            old: Option<&Arc<hrx::Buffer>>,
+            bytes: usize,
+        ) -> Result<Arc<hrx::Buffer>> {
+            if let Some(old) = old.filter(|b| b.bytes() >= bytes) {
+                return Ok(old.clone());
+            }
+            Ok(Arc::new(stream.allocate(bytes)?))
+        }
         let t = capacity;
         let widest = pitch(d.ffn).max(pitch(d.hidden)).max(pitch(d.inner()));
-        let a_q = stream.allocate(t * widest * if quant { 1 } else { 2 })?;
-        let a_s = stream.allocate(t * 4)?;
-        let fused = stream.allocate(t * d.qkv() * 2)?;
+        let a_q = allocation(
+            stream,
+            scratch.map(|s| &s.a_q),
+            t * widest * if quant { 1 } else { 2 },
+        )?;
+        let a_s = allocation(stream, scratch.map(|s| &s.a_s), t * 4)?;
+        let fused = allocation(stream, scratch.map(|s| &s.fused), t * d.qkv() * 2)?;
         let qkv_split = if fused_qkv || fused_operands {
             None // q, k and v are views into `fused`
         } else {
             Some((
-                stream.allocate(t * d.inner() * 2)?,
-                stream.allocate(t * d.kv_inner() * 2)?,
+                allocation(
+                    stream,
+                    scratch.and_then(|s| s.qkv_split.as_ref()).map(|s| &s.0),
+                    t * d.inner() * 2,
+                )?,
+                allocation(
+                    stream,
+                    scratch.and_then(|s| s.qkv_split.as_ref()).map(|s| &s.1),
+                    t * d.kv_inner() * 2,
+                )?,
                 if direct_v {
                     None
                 } else {
-                    Some(stream.allocate(t * d.kv_inner() * 2)?)
+                    Some(allocation(
+                        stream,
+                        scratch
+                            .and_then(|s| s.qkv_split.as_ref())
+                            .and_then(|s| s.2.as_ref()),
+                        t * d.kv_inner() * 2,
+                    )?)
                 },
             ))
         };
@@ -744,14 +819,18 @@ impl Stack {
         } else {
             d.inner()
         };
-        let attn = stream.allocate(t * attn_width * 2)?;
+        let attn = allocation(stream, scratch.map(|s| &s.attn), t * attn_width * 2)?;
         let gu_bytes = t * if direct_down { pitch(d.ffn) } else { d.ffn } * ffn_storage.bytes();
         // QKV is dead after the attention join. Gate/up starts only after the
         // output projection and second normalization, so it can reuse that storage.
         let gu = if env_once("H3_REUSE_SCRATCH") == Some("1") && gu_bytes <= t * d.qkv() * 2 {
             None
         } else {
-            Some(stream.allocate(gu_bytes)?)
+            Some(allocation(
+                stream,
+                scratch.and_then(|s| s.gu.as_ref()),
+                gu_bytes,
+            )?)
         };
         stream.fill(fused.slice(0, t * d.qkv() * 2), 0)?;
         stream.fill(attn.slice(0, t * attn_width * 2), 0)?;
@@ -765,18 +844,52 @@ impl Stack {
 
         let int_qk = if qk_int {
             let code_bytes = if d.attn_i4 { 64 } else { 128 };
-            let qi = stream.allocate(t * d.heads * code_bytes)?;
-            let ki = stream.allocate(t * d.heads * code_bytes)?;
-            let qs = stream.allocate(t * d.heads * 4)?;
-            let ks = stream.allocate(t * d.heads * 4)?;
-            let kmean = stream.allocate(d.inner() * 4)?;
-            let zmean = stream.allocate_zeroed(d.inner() * 4)?;
+            let qi = allocation(
+                stream,
+                scratch.and_then(|s| s.int_qk.as_ref()).map(|s| &s.qi),
+                t * d.heads * code_bytes,
+            )?;
+            let ki = allocation(
+                stream,
+                scratch.and_then(|s| s.int_qk.as_ref()).map(|s| &s.ki),
+                t * d.heads * code_bytes,
+            )?;
+            let qs = allocation(
+                stream,
+                scratch.and_then(|s| s.int_qk.as_ref()).map(|s| &s.qs),
+                t * d.heads * 4,
+            )?;
+            let ks = allocation(
+                stream,
+                scratch.and_then(|s| s.int_qk.as_ref()).map(|s| &s.ks),
+                t * d.heads * 4,
+            )?;
+            let kmean = allocation(
+                stream,
+                scratch.and_then(|s| s.int_qk.as_ref()).map(|s| &s.kmean),
+                d.inner() * 4,
+            )?;
+            let zmean = allocation(
+                stream,
+                scratch.and_then(|s| s.int_qk.as_ref()).map(|s| &s.zmean),
+                d.inner() * 4,
+            )?;
             let vt_bytes = d.inner() * t * 2;
             let vt = if qk_head_major && vt_bytes <= a_q.bytes() {
                 None
             } else {
-                Some(stream.allocate_zeroed(vt_bytes)?)
+                Some(allocation(
+                    stream,
+                    scratch
+                        .and_then(|s| s.int_qk.as_ref())
+                        .and_then(|s| s.vt.as_ref()),
+                    vt_bytes,
+                )?)
             };
+            stream.fill(zmean.binding(), 0)?;
+            if let Some(vt) = &vt {
+                stream.fill(vt.binding(), 0)?;
+            }
             stream.fill(qi.slice(0, t * d.heads * code_bytes), 0)?;
             stream.fill(ki.slice(0, t * d.heads * code_bytes), 0)?;
             stream.fill(qs.slice(0, t * d.heads * 4), 0)?;
@@ -789,6 +902,33 @@ impl Stack {
                 kmean,
                 zmean,
                 vt,
+            })
+        } else {
+            None
+        };
+
+        let vsa_gate = if blocks.iter().any(|b| b.vsa_gate.is_some()) {
+            Some(VsaGate {
+                prepare: Prepare::build(
+                    c, stream, "norm", "bf16", d.hidden, d.eps, d.classes, d.hidden,
+                )?,
+                projection: Gemm::build(
+                    c,
+                    stream,
+                    "plain",
+                    "bf16",
+                    false,
+                    true,
+                    d.hidden,
+                    d.inner(),
+                    tokens,
+                    1,
+                    d.hidden,
+                    Tile::Plain,
+                    0,
+                )?,
+                input: stream.allocate(capacity * d.hidden * 2)?,
+                output: stream.allocate(capacity * d.inner() * 2)?,
             })
         } else {
             None
@@ -828,6 +968,10 @@ impl Stack {
             rope,
             attention,
             world_attention: None,
+            vsa: None,
+            vsa_active: false,
+            vsa_dense_blocks: Vec::new(),
+            vsa_gate,
             colmean,
             prep_q,
             prep_k,
@@ -884,7 +1028,7 @@ impl Stack {
     fn gu_view(&self) -> View<'_> {
         self.gu
             .as_ref()
-            .map_or_else(|| self.fused.binding(), hrx::Buffer::binding)
+            .map_or_else(|| self.fused.binding(), |b| b.binding())
     }
 
     fn vt_view<'a>(&'a self, iq: &'a IntQk) -> View<'a> {
@@ -896,7 +1040,7 @@ impl Stack {
         }
         iq.vt.as_ref().map_or_else(
             || self.a_q.slice(0, self.d.inner() * self.capacity * 2),
-            hrx::Buffer::binding,
+            |b| b.binding(),
         )
     }
 
@@ -919,7 +1063,7 @@ impl Stack {
                 q.binding(),
                 k.binding(),
                 v.as_ref()
-                    .map_or_else(|| self.fused.binding(), hrx::Buffer::binding),
+                    .map_or_else(|| self.fused.binding(), |b| b.binding()),
             ),
             None => {
                 // [Q/K/V][head][capacity][64] in one allocation
@@ -1173,7 +1317,51 @@ impl Stack {
             if self.fused_operands {
                 self.prepare_fused_operands(sink, prof, t, qnorm, knorm, cos, sin)?;
             }
-            self.attend(sink, prof, t, q, k, v)?;
+            if let Some(vsa) = self.vsa.as_ref().filter(|_| {
+                self.vsa_active && !self.vsa_dense_blocks.contains(&(self.layer_offset + i))
+            }) {
+                let gate = if let (Some(runtime), Some(weight)) =
+                    (&self.vsa_gate, &self.blocks[i].vsa_gate)
+                {
+                    runtime.prepare.emit(
+                        sink,
+                        Some(prof),
+                        "VSA gate norm",
+                        t,
+                        x,
+                        Some((norm1, lc.table_msa, cls)),
+                        runtime.input.binding(),
+                        None,
+                    )?;
+                    runtime.projection.emit(
+                        sink,
+                        Some(prof),
+                        "VSA gate projection",
+                        t,
+                        runtime.input.binding(),
+                        weight.binding(),
+                        None,
+                        runtime.output.binding(),
+                        None,
+                        None,
+                    )?;
+                    Some(runtime.output.binding())
+                } else {
+                    None
+                };
+                vsa.emit(
+                    sink,
+                    prof,
+                    self.layer_offset + i,
+                    q,
+                    k,
+                    v,
+                    self.attn.binding(),
+                    gate,
+                )?;
+            } else {
+                self.attend(sink, prof, t, q, k, v)?;
+            }
 
             let attn_operand = if self.direct_attn {
                 self.attn.binding()

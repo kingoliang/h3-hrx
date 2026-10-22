@@ -21,6 +21,7 @@ impl MixedStack {
         qk_weights: bool,
         ones_head: Arc<hrx::Buffer>,
         tag: &str,
+        sparse: bool,
     ) -> Result<Self> {
         let quant = |i| w.has(&format!("{}qkv.s", prefix(i)));
         let mut runs = Vec::new();
@@ -33,7 +34,7 @@ impl MixedStack {
             let mut dims = d.clone();
             dims.wbits = if is_int8 { 8 } else { 16 };
             dims.bf16 = !is_int8;
-            let mut stack = Stack::new(
+            let mut stack = Stack::build(
                 c,
                 stream,
                 dims,
@@ -44,6 +45,8 @@ impl MixedStack {
                 qk_weights,
                 ones_head.clone(),
                 tag,
+                sparse,
+                runs.first(),
             )?;
             stack.layer_offset = first;
             runs.push(stack);
@@ -54,6 +57,31 @@ impl MixedStack {
             layers,
             calls: 0,
         })
+    }
+
+    pub(crate) fn set_vsa(
+        &mut self,
+        runtime: Option<Arc<crate::vsa::device::Runtime>>,
+        options: Option<&crate::VsaOptions>,
+    ) {
+        for stack in &mut self.runs {
+            stack.vsa = runtime.clone();
+            stack.vsa_active = false;
+            stack.vsa_dense_blocks = options.map_or_else(Vec::new, |o| o.dense_blocks.clone());
+        }
+    }
+
+    pub(crate) fn vsa_active(&mut self, active: bool) {
+        for stack in &mut self.runs {
+            stack.vsa_active = active;
+        }
+    }
+
+    pub(crate) fn vsa_gate_count(&self) -> usize {
+        self.runs
+            .iter()
+            .map(|s| s.blocks.iter().filter(|b| b.vsa_gate.is_some()).count())
+            .sum()
     }
 
     pub(crate) fn capacity(&self) -> usize {

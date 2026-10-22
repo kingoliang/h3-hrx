@@ -77,6 +77,10 @@ required-features = ["cli"]
 name = "cache_calibrate"
 test = true
 
+[[example]]
+name = "render_latents"
+required-features = ["cli"]
+
 [dependencies]
 hrx = { package = "hrx-rs", version = "0.10.1" }
 half = { version = "2", features = ["bytemuck"] }

@@ -1,0 +1,505 @@
+// Native VSA layout, pooling and routing. No token-by-token score allocation.
+amdgpu.target<gfx11-generic> @vsa_gfx11 {subgroup_size = 32}
+config.decl @h3.vsa.tokens : %value: index where [range(%value, 1, 1048576)]
+config.decl @h3.vsa.padded : %value: index where [range(%value, 64, 1048576)]
+config.decl @h3.vsa.width : %value: index where [range(%value, 128, 32768)]
+config.decl @h3.vsa.blocks : %value: index where [range(%value, 1, 16384)]
+config.decl @h3.vsa.heads : %value: index where [range(%value, 1, 256)]
+config.decl @h3.vsa.prefix : %value: index where [range(%value, 0, 16384)]
+config.decl @h3.vsa.topk : %value: index where [range(%value, 0, 16384)]
+kernel.def target(@vsa_gfx11) export("h3_vsa_gather") @h3_vsa_gather(%unused: index) {
+  %tokens = config.get @h3.vsa.tokens : index
+  %padded = config.get @h3.vsa.padded : index
+  %width = config.get @h3.vsa.width : index
+  %blocks = config.get @h3.vsa.blocks : index
+  %heads = config.get @h3.vsa.heads : index
+  %prefix = config.get @h3.vsa.prefix : index
+  %topk = config.get @h3.vsa.topk : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c32 = index.constant 32 : index
+  %c64 = index.constant 64 : index
+  %c128 = index.constant 128 : index
+  %c256 = index.constant 256 : index
+  %off = index.constant 0 : offset
+  %zero = scalar.constant 0.0 : f32
+  %one = scalar.constant 1.0 : f32
+  %neg = scalar.constant -1000000000.0 : f32
+  kernel.launch.config workgroups(%padded, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%unused: index, %src: buffer, %x: buffer, %y: buffer) {
+  %tokens = config.get @h3.vsa.tokens : index
+  %padded = config.get @h3.vsa.padded : index
+  %width = config.get @h3.vsa.width : index
+  %blocks = config.get @h3.vsa.blocks : index
+  %heads = config.get @h3.vsa.heads : index
+  %prefix = config.get @h3.vsa.prefix : index
+  %topk = config.get @h3.vsa.topk : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c32 = index.constant 32 : index
+  %c64 = index.constant 64 : index
+  %c128 = index.constant 128 : index
+  %c256 = index.constant 256 : index
+  %off = index.constant 0 : offset
+  %zero = scalar.constant 0.0 : f32
+  %one = scalar.constant 1.0 : f32
+  %neg = scalar.constant -1000000000.0 : f32
+  %src_g = buffer.assume.memory_space<global> %src : buffer
+  %src_v = buffer.view %src_g[%off] : buffer -> view<[%padded]xi32>
+  %x_g = buffer.assume.memory_space<global> %x : buffer
+  %x_v = buffer.view %x_g[%off] : buffer -> view<[%tokens]x[%width]xf16>
+  %y_g = buffer.assume.memory_space<global> %y : buffer
+  %y_v = buffer.view %y_g[%off] : buffer -> view<[%padded]x[%width]xf16>
+  %r0 = kernel.workgroup.id<x> : index
+  %r = index.assume %r0 [lt(%r0, %padded)] : index
+  %lane = kernel.workitem.id<x> : index
+    %si = view.load %src_v[%r] : view<[%padded]xi32> -> i32
+  %sr = index.cast %si : i32 to index
+  %live = index.cmp ult, %sr, %tokens : index
+  scf.for %col0 = [%lane to %width step %c256] {
+    %col = index.assume %col0 [lt(%col0, %width)] : index
+    %val = scf.if %live -> (f16) {
+      %row = index.assume %sr [lt(%sr, %tokens)] : index
+    %v = view.load %x_v[%row, %col] : view<[%tokens]x[%width]xf16> -> f16
+      scf.yield %v : f16
+    } else {
+      %z = scalar.constant 0.0 : f16
+      scf.yield %z : f16
+    }
+    view.store %val, %y_v[%r, %col] : f16, view<[%padded]x[%width]xf16>
+  }
+  kernel.return
+}
+kernel.def target(@vsa_gfx11) export("h3_vsa_scatter") @h3_vsa_scatter(%unused: index) {
+  %tokens = config.get @h3.vsa.tokens : index
+  %padded = config.get @h3.vsa.padded : index
+  %width = config.get @h3.vsa.width : index
+  %blocks = config.get @h3.vsa.blocks : index
+  %heads = config.get @h3.vsa.heads : index
+  %prefix = config.get @h3.vsa.prefix : index
+  %topk = config.get @h3.vsa.topk : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c32 = index.constant 32 : index
+  %c64 = index.constant 64 : index
+  %c128 = index.constant 128 : index
+  %c256 = index.constant 256 : index
+  %off = index.constant 0 : offset
+  %zero = scalar.constant 0.0 : f32
+  %one = scalar.constant 1.0 : f32
+  %neg = scalar.constant -1000000000.0 : f32
+  kernel.launch.config workgroups(%tokens, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%unused: index, %inverse: buffer, %x: buffer, %y: buffer) {
+  %tokens = config.get @h3.vsa.tokens : index
+  %padded = config.get @h3.vsa.padded : index
+  %width = config.get @h3.vsa.width : index
+  %blocks = config.get @h3.vsa.blocks : index
+  %heads = config.get @h3.vsa.heads : index
+  %prefix = config.get @h3.vsa.prefix : index
+  %topk = config.get @h3.vsa.topk : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c32 = index.constant 32 : index
+  %c64 = index.constant 64 : index
+  %c128 = index.constant 128 : index
+  %c256 = index.constant 256 : index
+  %off = index.constant 0 : offset
+  %zero = scalar.constant 0.0 : f32
+  %one = scalar.constant 1.0 : f32
+  %neg = scalar.constant -1000000000.0 : f32
+  %inverse_g = buffer.assume.memory_space<global> %inverse : buffer
+  %inverse_v = buffer.view %inverse_g[%off] : buffer -> view<[%tokens]xi32>
+  %x_g = buffer.assume.memory_space<global> %x : buffer
+  %x_v = buffer.view %x_g[%off] : buffer -> view<[%padded]x[%width]xf16>
+  %y_g = buffer.assume.memory_space<global> %y : buffer
+  %y_v = buffer.view %y_g[%off] : buffer -> view<[%tokens]x[%width]xf16>
+  %r0 = kernel.workgroup.id<x> : index
+  %r = index.assume %r0 [lt(%r0, %tokens)] : index
+  %lane = kernel.workitem.id<x> : index
+    %si = view.load %inverse_v[%r] : view<[%tokens]xi32> -> i32
+  %sr0 = index.cast %si : i32 to index
+  %sr = index.assume %sr0 [range(%sr0, 0, 1048575), lt(%sr0, %padded)] : index
+  scf.for %col0 = [%lane to %width step %c256] {
+    %col = index.assume %col0 [lt(%col0, %width)] : index
+    %val = view.load %x_v[%sr, %col] : view<[%padded]x[%width]xf16> -> f16
+    view.store %val, %y_v[%r, %col] : f16, view<[%tokens]x[%width]xf16>
+  }
+  kernel.return
+}
+kernel.def target(@vsa_gfx11) export("h3_vsa_pool") @h3_vsa_pool(%unused: index) {
+  %tokens = config.get @h3.vsa.tokens : index
+  %padded = config.get @h3.vsa.padded : index
+  %width = config.get @h3.vsa.width : index
+  %blocks = config.get @h3.vsa.blocks : index
+  %heads = config.get @h3.vsa.heads : index
+  %prefix = config.get @h3.vsa.prefix : index
+  %topk = config.get @h3.vsa.topk : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c32 = index.constant 32 : index
+  %c64 = index.constant 64 : index
+  %c128 = index.constant 128 : index
+  %c256 = index.constant 256 : index
+  %off = index.constant 0 : offset
+  %zero = scalar.constant 0.0 : f32
+  %one = scalar.constant 1.0 : f32
+  %neg = scalar.constant -1000000000.0 : f32
+  kernel.launch.config workgroups(%blocks, %heads, %c1) workgroup_size(%c128, %c1, %c1) : index
+} launch(%unused: index, %lengths: buffer, %x: buffer, %means: buffer) {
+  %tokens = config.get @h3.vsa.tokens : index
+  %padded = config.get @h3.vsa.padded : index
+  %width = config.get @h3.vsa.width : index
+  %blocks = config.get @h3.vsa.blocks : index
+  %heads = config.get @h3.vsa.heads : index
+  %prefix = config.get @h3.vsa.prefix : index
+  %topk = config.get @h3.vsa.topk : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c32 = index.constant 32 : index
+  %c64 = index.constant 64 : index
+  %c128 = index.constant 128 : index
+  %c256 = index.constant 256 : index
+  %off = index.constant 0 : offset
+  %zero = scalar.constant 0.0 : f32
+  %one = scalar.constant 1.0 : f32
+  %neg = scalar.constant -1000000000.0 : f32
+  %lengths_g = buffer.assume.memory_space<global> %lengths : buffer
+  %lengths_v = buffer.view %lengths_g[%off] : buffer -> view<[%blocks]xi32>
+  %x_g = buffer.assume.memory_space<global> %x : buffer
+  %x_v = buffer.view %x_g[%off] : buffer -> view<[%padded]x[%width]xf16>
+  %means_g = buffer.assume.memory_space<global> %means : buffer
+  %means_v = buffer.view %means_g[%off] : buffer -> view<[%blocks]x[%width]xf32>
+  %b0 = kernel.workgroup.id<x> : index
+  %b = index.assume %b0 [lt(%b0, %blocks)] : index
+  %h = kernel.workgroup.id<y> : index
+  %lane = kernel.workitem.id<x> : index
+  %hbase = index.mul %h, %c128 : index
+  %col0 = index.add %hbase, %lane : index
+  %col = index.assume %col0 [lt(%col0, %width)] : index
+  %row0 = index.mul %b, %c64 : index
+    %li = view.load %lengths_v[%b] : view<[%blocks]xi32> -> i32
+  %len = index.cast %li : i32 to index
+  %sum = scf.for %j = [%c0 to %len step %c1](%acc = %zero : f32) -> (f32) {
+    %r0 = index.add %row0, %j : index
+    %r = index.assume %r0 [lt(%r0, %padded)] : index
+    %v = view.load %x_v[%r, %col] : view<[%padded]x[%width]xf16> -> f16
+    %f = scalar.extf %v : f16 to f32
+    %a = scalar.addf %acc, %f : f32
+    scf.yield %a : f32
+  }
+  %lf = scalar.sitofp %li : i32 to f32
+  %mean = scalar.divf %sum, %lf : f32
+    view.store %mean, %means_v[%b, %col] : f32, view<[%blocks]x[%width]xf32>
+  kernel.return
+}
+kernel.def target(@vsa_gfx11) export("h3_vsa_scores") @h3_vsa_scores(%unused: index) {
+  %tokens = config.get @h3.vsa.tokens : index
+  %padded = config.get @h3.vsa.padded : index
+  %width = config.get @h3.vsa.width : index
+  %blocks = config.get @h3.vsa.blocks : index
+  %heads = config.get @h3.vsa.heads : index
+  %prefix = config.get @h3.vsa.prefix : index
+  %topk = config.get @h3.vsa.topk : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c32 = index.constant 32 : index
+  %c64 = index.constant 64 : index
+  %c128 = index.constant 128 : index
+  %c256 = index.constant 256 : index
+  %off = index.constant 0 : offset
+  %zero = scalar.constant 0.0 : f32
+  %one = scalar.constant 1.0 : f32
+  %neg = scalar.constant -1000000000.0 : f32
+  kernel.launch.config workgroups(%blocks, %heads, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%unused: index, %qm: buffer, %km: buffer, %scores: buffer) {
+  %tokens = config.get @h3.vsa.tokens : index
+  %padded = config.get @h3.vsa.padded : index
+  %width = config.get @h3.vsa.width : index
+  %blocks = config.get @h3.vsa.blocks : index
+  %heads = config.get @h3.vsa.heads : index
+  %prefix = config.get @h3.vsa.prefix : index
+  %topk = config.get @h3.vsa.topk : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c32 = index.constant 32 : index
+  %c64 = index.constant 64 : index
+  %c128 = index.constant 128 : index
+  %c256 = index.constant 256 : index
+  %off = index.constant 0 : offset
+  %zero = scalar.constant 0.0 : f32
+  %one = scalar.constant 1.0 : f32
+  %neg = scalar.constant -1000000000.0 : f32
+  %qm_g = buffer.assume.memory_space<global> %qm : buffer
+  %qm_v = buffer.view %qm_g[%off] : buffer -> view<[%blocks]x[%width]xf32>
+  %km_g = buffer.assume.memory_space<global> %km : buffer
+  %km_v = buffer.view %km_g[%off] : buffer -> view<[%blocks]x[%width]xf32>
+  %scores_g = buffer.assume.memory_space<global> %scores : buffer
+  %scores_v = buffer.view %scores_g[%off] : buffer -> view<[%heads]x[%blocks]x[%blocks]xf32>
+  %q0 = kernel.workgroup.id<x> : index
+  %q = index.assume %q0 [lt(%q0, %blocks)] : index
+  %h0 = kernel.workgroup.id<y> : index
+  %h = index.assume %h0 [lt(%h0, %heads)] : index
+  %lane = kernel.workitem.id<x> : index
+  %hc = index.mul %h, %c128 : index
+  scf.for %j0 = [%lane to %blocks step %c256] {
+    %j = index.assume %j0 [lt(%j0, %blocks)] : index
+    %dot = scf.for %d = [%c0 to %c128 step %c1](%acc = %zero : f32) -> (f32) {
+      %c0a = index.add %hc, %d : index
+      %c = index.assume %c0a [lt(%c0a, %width)] : index
+    %qv = view.load %qm_v[%q, %c] : view<[%blocks]x[%width]xf32> -> f32
+    %kv = view.load %km_v[%j, %c] : view<[%blocks]x[%width]xf32> -> f32
+      %prod = scalar.fmaf %qv, %kv, %acc : f32
+      scf.yield %prod : f32
+    }
+    view.store %dot, %scores_v[%h, %q, %j] : f32, view<[%heads]x[%blocks]x[%blocks]xf32>
+  }
+  kernel.return
+}
+kernel.def target(@vsa_gfx11) export("h3_vsa_route") @h3_vsa_route(%unused: index) {
+  %tokens = config.get @h3.vsa.tokens : index
+  %padded = config.get @h3.vsa.padded : index
+  %width = config.get @h3.vsa.width : index
+  %blocks = config.get @h3.vsa.blocks : index
+  %heads = config.get @h3.vsa.heads : index
+  %prefix = config.get @h3.vsa.prefix : index
+  %topk = config.get @h3.vsa.topk : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c32 = index.constant 32 : index
+  %c64 = index.constant 64 : index
+  %c128 = index.constant 128 : index
+  %c256 = index.constant 256 : index
+  %off = index.constant 0 : offset
+  %zero = scalar.constant 0.0 : f32
+  %one = scalar.constant 1.0 : f32
+  %neg = scalar.constant -1000000000.0 : f32
+  kernel.launch.config workgroups(%blocks, %heads, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%unused: index, %scores: buffer, %routes: buffer) {
+  %tokens = config.get @h3.vsa.tokens : index
+  %padded = config.get @h3.vsa.padded : index
+  %width = config.get @h3.vsa.width : index
+  %blocks = config.get @h3.vsa.blocks : index
+  %heads = config.get @h3.vsa.heads : index
+  %prefix = config.get @h3.vsa.prefix : index
+  %topk = config.get @h3.vsa.topk : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c32 = index.constant 32 : index
+  %c64 = index.constant 64 : index
+  %c128 = index.constant 128 : index
+  %c256 = index.constant 256 : index
+  %off = index.constant 0 : offset
+  %zero = scalar.constant 0.0 : f32
+  %one = scalar.constant 1.0 : f32
+  %neg = scalar.constant -1000000000.0 : f32
+  %scores_g = buffer.assume.memory_space<global> %scores : buffer
+  %scores_v = buffer.view %scores_g[%off] : buffer -> view<[%heads]x[%blocks]x[%blocks]xf32>
+  %routes_g = buffer.assume.memory_space<global> %routes : buffer
+  %routes_v = buffer.view %routes_g[%off] : buffer -> view<[%heads]x[%blocks]x[%blocks]xi32>
+  %q0 = kernel.workgroup.id<x> : index
+  %q = index.assume %q0 [lt(%q0, %blocks)] : index
+  %h0 = kernel.workgroup.id<y> : index
+  %h = index.assume %h0 [lt(%h0, %heads)] : index
+  %lane = kernel.workitem.id<x> : index
+  %sink_q = index.cmp ult, %q, %prefix : index
+  scf.for %j0 = [%lane to %blocks step %c256] {
+    %j = index.assume %j0 [lt(%j0, %blocks)] : index
+    %sink_k = index.cmp ult, %j, %prefix : index
+    %qp1 = index.add %q, %c1 : index
+    %jp1 = index.add %j, %c1 : index
+    %near0 = index.cmp ule, %j, %qp1 : index
+    %near1 = index.cmp ule, %q, %jp1 : index
+    %near = scalar.andi %near0, %near1 : i1
+    %sinks = scalar.ori %sink_q, %sink_k : i1
+    %forced = scalar.ori %near, %sinks : i1
+    %keep = scf.if %forced -> (index) {
+      scf.yield %c1 : index
+    } else {
+    %own = view.load %scores_v[%h, %q, %j] : view<[%heads]x[%blocks]x[%blocks]xf32> -> f32
+      %rank = scf.for %k = [%prefix to %blocks step %c1](%count = %c0 : index) -> (index) {
+        %kk = index.assume %k [lt(%k, %blocks)] : index
+    %other = view.load %scores_v[%h, %q, %kk] : view<[%heads]x[%blocks]x[%blocks]xf32> -> f32
+        %greater = scalar.cmpf ogt, %other, %own : f32
+        %inc = scf.select %greater, %c1, %c0 : index
+        %next = index.add %count, %inc : index
+        scf.yield %next : index
+      }
+      %selected = index.cmp ult, %rank, %topk : index
+      %yes = scf.select %selected, %c1, %c0 : index
+      scf.yield %yes : index
+    }
+    %result = index.cast %keep : index to i32
+    view.store %result, %routes_v[%h, %q, %j] : i32, view<[%heads]x[%blocks]x[%blocks]xi32>
+  }
+  kernel.return
+}
+kernel.def target(@vsa_gfx11) export("h3_vsa_coarse") @h3_vsa_coarse(%unused: index) {
+  %tokens = config.get @h3.vsa.tokens : index
+  %padded = config.get @h3.vsa.padded : index
+  %width = config.get @h3.vsa.width : index
+  %blocks = config.get @h3.vsa.blocks : index
+  %heads = config.get @h3.vsa.heads : index
+  %prefix = config.get @h3.vsa.prefix : index
+  %topk = config.get @h3.vsa.topk : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c32 = index.constant 32 : index
+  %c64 = index.constant 64 : index
+  %c128 = index.constant 128 : index
+  %c256 = index.constant 256 : index
+  %off = index.constant 0 : offset
+  %zero = scalar.constant 0.0 : f32
+  %one = scalar.constant 1.0 : f32
+  %neg = scalar.constant -1000000000.0 : f32
+  kernel.launch.config workgroups(%blocks, %heads, %c1) workgroup_size(%c128, %c1, %c1) : index
+} launch(%unused: index, %scores: buffer, %vm: buffer, %coarse: buffer) {
+  %tokens = config.get @h3.vsa.tokens : index
+  %padded = config.get @h3.vsa.padded : index
+  %width = config.get @h3.vsa.width : index
+  %blocks = config.get @h3.vsa.blocks : index
+  %heads = config.get @h3.vsa.heads : index
+  %prefix = config.get @h3.vsa.prefix : index
+  %topk = config.get @h3.vsa.topk : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c32 = index.constant 32 : index
+  %c64 = index.constant 64 : index
+  %c128 = index.constant 128 : index
+  %c256 = index.constant 256 : index
+  %off = index.constant 0 : offset
+  %zero = scalar.constant 0.0 : f32
+  %one = scalar.constant 1.0 : f32
+  %neg = scalar.constant -1000000000.0 : f32
+  %scores_g = buffer.assume.memory_space<global> %scores : buffer
+  %scores_v = buffer.view %scores_g[%off] : buffer -> view<[%heads]x[%blocks]x[%blocks]xf32>
+  %vm_g = buffer.assume.memory_space<global> %vm : buffer
+  %vm_v = buffer.view %vm_g[%off] : buffer -> view<[%blocks]x[%width]xf32>
+  %coarse_g = buffer.assume.memory_space<global> %coarse : buffer
+  %coarse_v = buffer.view %coarse_g[%off] : buffer -> view<[%blocks]x[%width]xf32>
+  %q0 = kernel.workgroup.id<x> : index
+  %q = index.assume %q0 [lt(%q0, %blocks)] : index
+  %h0 = kernel.workgroup.id<y> : index
+  %h = index.assume %h0 [lt(%h0, %heads)] : index
+  %lane = kernel.workitem.id<x> : index
+  %scale = scalar.constant 0.08838834764831845 : f32
+  %hc = index.mul %h, %c128 : index
+  %col0 = index.add %hc, %lane : index
+  %col = index.assume %col0 [lt(%col0, %width)] : index
+  %max = scf.for %j0 = [%c0 to %blocks step %c1](%m = %neg : f32) -> (f32) {
+    %j = index.assume %j0 [lt(%j0, %blocks)] : index
+    %sv = view.load %scores_v[%h, %q, %j] : view<[%heads]x[%blocks]x[%blocks]xf32> -> f32
+    %s = scalar.mulf %sv, %scale : f32
+    %next = scalar.maxnumf %s, %m : f32
+    scf.yield %next : f32
+  }
+  %total, %weighted = scf.for %j0 = [%c0 to %blocks step %c1](%sum = %zero : f32, %acc = %zero : f32) -> (f32, f32) {
+    %j = index.assume %j0 [lt(%j0, %blocks)] : index
+    %sv = view.load %scores_v[%h, %q, %j] : view<[%heads]x[%blocks]x[%blocks]xf32> -> f32
+    %vv = view.load %vm_v[%j, %col] : view<[%blocks]x[%width]xf32> -> f32
+    %s = scalar.mulf %sv, %scale : f32
+    %delta = scalar.subf %s, %max : f32
+    %weight = scalar.expf<afn> %delta : f32
+    %next_sum = scalar.addf %sum, %weight : f32
+    %next = scalar.fmaf %weight, %vv, %acc : f32
+    scf.yield %next_sum, %next : f32, f32
+  }
+  %value = scalar.divf %weighted, %total : f32
+    view.store %value, %coarse_v[%q, %col] : f32, view<[%blocks]x[%width]xf32>
+  kernel.return
+}
+kernel.def target(@vsa_gfx11) export("h3_vsa_gated_scatter") @h3_vsa_gated_scatter(%unused: index) {
+  %tokens = config.get @h3.vsa.tokens : index
+  %padded = config.get @h3.vsa.padded : index
+  %width = config.get @h3.vsa.width : index
+  %blocks = config.get @h3.vsa.blocks : index
+  %heads = config.get @h3.vsa.heads : index
+  %prefix = config.get @h3.vsa.prefix : index
+  %topk = config.get @h3.vsa.topk : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c32 = index.constant 32 : index
+  %c64 = index.constant 64 : index
+  %c128 = index.constant 128 : index
+  %c256 = index.constant 256 : index
+  %off = index.constant 0 : offset
+  %zero = scalar.constant 0.0 : f32
+  %one = scalar.constant 1.0 : f32
+  %neg = scalar.constant -1000000000.0 : f32
+  kernel.launch.config workgroups(%tokens, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%unused: index, %inverse: buffer, %fine: buffer, %gate: buffer, %coarse: buffer, %out: buffer) {
+  %tokens = config.get @h3.vsa.tokens : index
+  %padded = config.get @h3.vsa.padded : index
+  %width = config.get @h3.vsa.width : index
+  %blocks = config.get @h3.vsa.blocks : index
+  %heads = config.get @h3.vsa.heads : index
+  %prefix = config.get @h3.vsa.prefix : index
+  %topk = config.get @h3.vsa.topk : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c32 = index.constant 32 : index
+  %c64 = index.constant 64 : index
+  %c128 = index.constant 128 : index
+  %c256 = index.constant 256 : index
+  %off = index.constant 0 : offset
+  %zero = scalar.constant 0.0 : f32
+  %one = scalar.constant 1.0 : f32
+  %neg = scalar.constant -1000000000.0 : f32
+  %inverse_g = buffer.assume.memory_space<global> %inverse : buffer
+  %inverse_v = buffer.view %inverse_g[%off] : buffer -> view<[%tokens]xi32>
+  %fine_g = buffer.assume.memory_space<global> %fine : buffer
+  %fine_v = buffer.view %fine_g[%off] : buffer -> view<[%padded]x[%width]xf16>
+  %gate_g = buffer.assume.memory_space<global> %gate : buffer
+  %gate_v = buffer.view %gate_g[%off] : buffer -> view<[%tokens]x[%width]xf16>
+  %coarse_g = buffer.assume.memory_space<global> %coarse : buffer
+  %coarse_v = buffer.view %coarse_g[%off] : buffer -> view<[%blocks]x[%width]xf32>
+  %out_g = buffer.assume.memory_space<global> %out : buffer
+  %out_v = buffer.view %out_g[%off] : buffer -> view<[%tokens]x[%width]xf16>
+  %r0 = kernel.workgroup.id<x> : index
+  %r = index.assume %r0 [lt(%r0, %tokens)] : index
+  %lane = kernel.workitem.id<x> : index
+    %si = view.load %inverse_v[%r] : view<[%tokens]xi32> -> i32
+  %sr0 = index.cast %si : i32 to index
+  %sr = index.assume %sr0 [range(%sr0, 0, 1048575), lt(%sr0, %padded)] : index
+  %b0 = index.div %sr, %c64 : index
+  %b = index.assume %b0 [lt(%b0, %blocks)] : index
+  scf.for %col0 = [%lane to %width step %c256] {
+    %col = index.assume %col0 [lt(%col0, %width)] : index
+    %f = view.load %fine_v[%sr, %col] : view<[%padded]x[%width]xf16> -> f16
+    %g = view.load %gate_v[%r, %col] : view<[%tokens]x[%width]xf16> -> f16
+    %c = view.load %coarse_v[%b, %col] : view<[%blocks]x[%width]xf32> -> f32
+    %ff = scalar.extf %f : f16 to f32
+    %gf = scalar.extf %g : f16 to f32
+    %combined = scalar.fmaf %gf, %c, %ff : f32
+    %result = scalar.fptrunc %combined : f32 to f16
+    view.store %result, %out_v[%r, %col] : f16, view<[%tokens]x[%width]xf16>
+  }
+  kernel.return
+}

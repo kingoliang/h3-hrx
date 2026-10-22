@@ -42,6 +42,7 @@ fn shape(p: &DenoiseParams) -> Result<Shape> {
     let sh = Session::shape_for(p.height, p.width, p.frames)
         .ok_or_else(|| Error::Invalid("invalid world canvas or duration".into()))?;
     if p.frames != sh.frames
+        || p.scheduler != crate::Scheduler::Uniform
         || p.sampler != Sampler::Euler
         || p.cache_threshold != 0.0
         || !(2..=1000).contains(&p.steps)
@@ -212,6 +213,7 @@ impl WorldState {
             video_shift: float("video_shift")?,
             audio_shift: float("audio_shift")?,
             sampler: Sampler::Euler,
+            scheduler: crate::Scheduler::Uniform,
             cache_threshold: 0.0,
         };
         shape(&p)?;

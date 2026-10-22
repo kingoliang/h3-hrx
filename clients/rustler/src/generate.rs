@@ -56,6 +56,8 @@ pub struct GenerateRequest {
 pub fn run(
     session: &mut Session,
     request: GenerateRequest,
+    options: crate::options::GenerateOptions,
+    explicit_checkpoint: bool,
 ) -> h3_hrx::Result<h3_hrx::UpscaledLatents> {
     let mut p = DenoiseParams {
         width: request.width,
@@ -65,6 +67,7 @@ pub fn run(
         seed: request.seed,
         ..Default::default()
     };
+    p = options.sampling.resolve(p, explicit_checkpoint)?;
     let shape = h3_hrx::shape_for(p.height, p.width, p.frames)
         .ok_or_else(|| h3_hrx::Error::Invalid("invalid generation dimensions".into()))?;
     let upscale = h3_hrx::UpscaleSettings {
@@ -74,13 +77,17 @@ pub fn run(
         },
         ..Default::default()
     };
-    upscale.output_shape(&shape)?;
+    if !options.bypass_upscale {
+        upscale.output_shape(&shape)?;
+    }
     let refine = h3_hrx::RefinementSettings {
         steps: request.upscale_steps,
         denoise: request.upscale_denoise,
         seed: request.upscale_seed,
     };
-    refine.validate()?;
+    if !options.bypass_upscale {
+        refine.validate()?;
+    }
     let prepared = request
         .refmods
         .iter()
@@ -103,6 +110,12 @@ pub fn run(
     }
     let ids = h3_hrx::Tokenizer::new()?.encode(&request.prompt)?;
     let initial = session.denoise(&ids, &p, h3_hrx::Noise::default(), &refs, &[], None)?;
+    if options.bypass_upscale {
+        return Ok(h3_hrx::UpscaledLatents {
+            shape,
+            latents: initial,
+        });
+    }
     let mut out = session.upscale_latents(&initial, &shape, &upscale, None)?;
     (p.width, p.height) = out.shape.size();
     out.latents = session.refine(&ids, None, &p, &out.latents, &refine, &refs, &[], None)?;

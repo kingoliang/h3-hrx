@@ -1,0 +1,98 @@
+# FastH3 sampling and VSA
+
+The explicit `fasth3` preset selects 10/3 shifts, `simple`, `res_multistep`, and
+10 evaluations. Existing defaults and the legacy sigma-point `steps` field are
+preserved. Euler is also supported; no additional samplers or SLA/Sol modes are
+introduced. The checkpoint must have the existing H3 architecture and folded
+AdaLN tables.
+
+## Reference definitions
+
+The implementation and reproducible fixtures use:
+
+- [ComfyUI](https://github.com/comfyanonymous/ComfyUI/tree/7a28332047b6af638dc6c7f72ef3481a718769fd),
+  revision `7a28332047b6af638dc6c7f72ef3481a718769fd`.
+- [comfy-kitchen](https://github.com/Comfy-Org/comfy-kitchen/tree/f8b7e97a1418d2e529bd5405fbf86312be198ae6),
+  revision `f8b7e97a1418d2e529bd5405fbf86312be198ae6`.
+- [FastH3 workflow](https://github.com/Comfy-Org/workflow_templates/blob/447747bf37b7e2f6d5fab3f15288e03bf889b82f/templates/video_fastvideo_fasth3_t2v.json),
+  revision `447747bf37b7e2f6d5fab3f15288e03bf889b82f`.
+- [Gated FastH3 checkpoint](https://huggingface.co/FastVideo/FastVideo-FastH3-Comfy/tree/ec1e3aa374a91c57b0b94a1623b7e657c0498cf2),
+  revision `ec1e3aa374a91c57b0b94a1623b7e657c0498cf2`.
+
+`simple` selects entries from the 1,000-entry FP32 flow table using ComfyUI's
+index rule, then remaps video sigmas to the audio shift. Tests compare both
+streams and their clean-time conditioning values bit-for-bit, including 8, 10,
+12, non-divisor counts and boundaries. The legacy uniform calculation is unchanged.
+
+VSA packs video into 4×4×4 cubes, stably puts live rows before padding, and pads
+each prefix segment independently to 64 rows. Prefix keys and queries remain
+exact. Routing selects the top fraction of non-prefix blocks per head, retains
+ties, and forces the diagonal ±1 blocks. Padding never contributes as a key.
+There is no pooled tail or extra-token augmentation.
+
+Compatible learned compression gates add dense attention over the block means,
+multiplied by the raw linear gate; there is no sigmoid. Gate weights accept BF16,
+F16, F32, or validated per-row INT8 ConvRot H256. They are prepared as BF16 for
+the native gate projection. B6 has no such gates and uses fine attention alone.
+
+This is native algorithm compatibility, not bitwise ComfyUI kernel parity.
+Routing uses FP32 means. INT8 attention quantizes rotated Q/K while retaining
+FP16 V; it reuses the previous sparse evaluation's per-block K-centering state.
+Unlike the upstream all-INT8 producer, it needs no stale V scale or V clipping.
+All state resets between requests. The existing native activation arithmetic
+also differs from ComfyUI's BF16 path.
+
+GPU gather, pooling, routing, sparse attention, optional coarse attention, and
+scatter execute without host routing readbacks. Only block-by-block score and
+route matrices are allocated. Dense and sparse recordings are separate; every
+replay recomputes routes from the current Q/K. Sequential mixed-precision runs
+share scratch buffers, with graph dependencies preserving the ordering.
+
+## Reproduce validation
+
+CPU/API checks:
+
+```sh
+cargo test --locked --release --workspace --no-default-features --features cli,prompt-generation
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+```
+
+Native kernel and pinned PyTorch oracle checks:
+
+```sh
+H3_VSA_FIXTURE=target/vsa-fixture cargo test --release --lib vsa::device::tests -- --nocapture
+python scripts/vsa_reference.py target/vsa-fixture
+```
+
+The native test covers partial cubes, exact prefixes, tied routing scores,
+negative compression gates, both precision modes, and eager/graph equality.
+Thresholds are normalized RMSE ≤1% for FP16 and ≤3% for INT8. On gfx1151 the
+pinned oracle comparison measured approximately 0.014% and 0.18%, respectively,
+for both fine-only and gated fixtures.
+
+The matrix harness prepares text once, releases the encoder, and then runs
+Euler and res_multistep at 8, 10, and 12 evaluations. It checks finite outputs,
+cancellation, layout changes, deterministic retries, and budget retirement.
+Use `dense`, `vsa`, or `observe`; the latter two force VSA below its normal token
+threshold so small fixtures actually exercise sparse kernels.
+
+```sh
+H3_GRAPH=1 H3_STAGE_TRACE=1 \
+H3_QUALIFY_CHECKPOINT="$HOME/h3_b6_int8.safetensors" \
+H3_QUALIFY_OUT=target/b6-matrix H3_QUALIFY_PATTERN=vsa \
+cargo test --release --lib dit::qualification::fasth3_matrix -- --ignored --exact --nocapture
+```
+
+Repeat with `H3_GRAPH=0` to compare eager output files byte-for-byte, and with
+`H3_QUALIFY_PATTERN=observe` to compare cache observation. For production-size
+qualification add `H3_QUALIFY_FULL=1`: this runs 1344×768, 124 frames, ten
+evaluations after a two-evaluation warmup and restores the normal
+12,288-token threshold. Step timings and native reserved memory are printed separately
+from model preparation. `H3_STAGE_TRACE=1` records all resolved sampling and
+attention options, sigmas, evaluation counts, sparse-block counts, and dense
+fallback reasons.
+
+Legacy digest baselines are not regenerated by this work. The existing standard
+checkpoint denoising digest test already failed on the original checkout; see
+its actual output rather than treating that known mismatch as a new FastH3
+baseline.

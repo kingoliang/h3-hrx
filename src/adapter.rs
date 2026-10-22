@@ -21,6 +21,7 @@ impl TurboPreset {
         params.frames = 124;
         params.steps = self.evaluations() + 1;
         params.sampler = crate::Sampler::Euler;
+        params.scheduler = crate::Scheduler::Uniform;
         params.video_shift = 6.0;
         params.audio_shift = 3.0;
         params.cache_threshold = 0.0;

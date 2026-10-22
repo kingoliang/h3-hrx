@@ -59,6 +59,8 @@ enum Residency {
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
 enum Preset {
     Base,
+    #[value(name = "fasth3")]
+    FastH3,
     #[value(name = "turbo-768p-4")]
     TurboFour,
     #[value(name = "turbo-768p-8")]
@@ -68,7 +70,7 @@ enum Preset {
 impl Preset {
     fn turbo(self) -> Option<h3_hrx::adapter::TurboPreset> {
         match self {
-            Self::Base => None,
+            Self::Base | Self::FastH3 => None,
             Self::TurboFour => Some(h3_hrx::adapter::TurboPreset::Four),
             Self::TurboEight => Some(h3_hrx::adapter::TurboPreset::Eight),
         }
@@ -180,7 +182,7 @@ struct GenerationArgs {
     files: Vec<PathBuf>,
 
     /// Generation preset (Turbo is experimental until qualification completes)
-    #[arg(long, value_enum, default_value = "base", hide = true)]
+    #[arg(long, value_enum, default_value = "base")]
     preset: Preset,
 
     /// The prompt (otherwise read from stdin)
@@ -215,6 +217,19 @@ struct GenerationArgs {
     #[arg(long, value_parser = clap::value_parser!(i32).range(2..=1000))]
     steps: Option<i32>,
 
+    /// Number of model evaluations (one fewer than legacy --steps)
+    #[arg(long, conflicts_with = "steps", value_parser = clap::value_parser!(i32).range(1..=999))]
+    evaluations: Option<i32>,
+
+    /// Sigma schedule (FastH3: simple; base: uniform)
+    #[arg(long, value_parser = ["uniform", "simple"])]
+    scheduler: Option<String>,
+
+    #[arg(long)]
+    video_shift: Option<f64>,
+    #[arg(long)]
+    audio_shift: Option<f64>,
+
     /// Output width (base default: 864)
     #[arg(long, value_parser = clap::value_parser!(i32).range(32..=8192))]
     width: Option<i32>,
@@ -229,6 +244,21 @@ struct GenerationArgs {
     /// The DiT attention's QK^T operands (i8 is the parity path)
     #[arg(long, value_enum, default_value = "i8")]
     attn: Attn,
+
+    /// Dense attention or VSA cube routing; independent of --attn precision
+    #[arg(long, value_parser = ["dense", "vsa"], default_value = "dense")]
+    attention_pattern: String,
+    #[arg(long)]
+    vsa_keep_percent: Option<f64>,
+    #[arg(long)]
+    vsa_start: Option<f64>,
+    #[arg(long)]
+    vsa_end: Option<f64>,
+    #[arg(long)]
+    vsa_min_tokens: Option<usize>,
+    /// Comma-separated global zero-based blocks that always run dense
+    #[arg(long, value_delimiter = ',')]
+    vsa_dense_blocks: Vec<usize>,
 
     /// Sampler (base default: res_multistep)
     #[arg(long, value_enum)]
@@ -468,8 +498,45 @@ fn memory_budget_bytes(cli: &Cli) -> Result<Option<usize>> {
     Ok(Some(bytes))
 }
 
+fn attention_pattern(cli: &Cli) -> Result<h3_hrx::AttentionPattern> {
+    let pattern = if cli.attention_pattern == "vsa" {
+        h3_hrx::AttentionPattern::Vsa(h3_hrx::VsaOptions {
+            keep_percent: cli.vsa_keep_percent.unwrap_or(10.0),
+            start: cli.vsa_start.unwrap_or(0.2),
+            end: cli.vsa_end.unwrap_or(1.0),
+            min_tokens: cli.vsa_min_tokens.unwrap_or(12288),
+            dense_blocks: cli.vsa_dense_blocks.clone(),
+        })
+    } else {
+        if cli.vsa_keep_percent.is_some()
+            || cli.vsa_start.is_some()
+            || cli.vsa_end.is_some()
+            || cli.vsa_min_tokens.is_some()
+            || !cli.vsa_dense_blocks.is_empty()
+        {
+            usage!("VSA options require --attention-pattern vsa");
+        }
+        h3_hrx::AttentionPattern::Dense
+    };
+    pattern
+        .validate(match cli.attn {
+            Attn::F16 => h3_hrx::Attention::F16,
+            Attn::I8 => h3_hrx::Attention::I8,
+            Attn::I4 => h3_hrx::Attention::I4,
+        })
+        .map_err(|e| UsageError(e.to_string()))?;
+    if matches!(pattern, h3_hrx::AttentionPattern::Vsa(_))
+        && (cli.preset.turbo().is_some()
+            || matches!(cache_policy(cli)?, h3_hrx::CachePolicy::Conservative(_)))
+    {
+        usage!("VSA requires Turbo off and residual cache reuse off");
+    }
+    Ok(pattern)
+}
+
 fn parameters(cli: &Cli) -> Result<DenoiseParams> {
     memory_budget_bytes(cli)?;
+    attention_pattern(cli)?;
     let cache = cache_policy(cli)?;
     let mut params = DenoiseParams {
         width: cli.width.unwrap_or(864),
@@ -483,7 +550,38 @@ fn parameters(cli: &Cli) -> Result<DenoiseParams> {
         },
         ..DenoiseParams::default()
     };
+    params = h3_hrx::SamplingOptions {
+        preset: (cli.preset == Preset::FastH3).then_some(h3_hrx::SamplingPreset::FastH3),
+        steps: cli.steps.map(|n| n as usize),
+        evaluations: cli.evaluations.map(|n| n as usize),
+        sampler: cli.sampler.map(|s| match s {
+            Sampler::Euler => Sampler16::Euler,
+            Sampler::ResMultistep => Sampler16::ResMultistep,
+        }),
+        scheduler: cli.scheduler.as_deref().map(|s| {
+            if s == "simple" {
+                h3_hrx::Scheduler::Simple
+            } else {
+                h3_hrx::Scheduler::Uniform
+            }
+        }),
+        video_shift: cli.video_shift,
+        audio_shift: cli.audio_shift,
+    }
+    .resolve(params, cli.dit.is_some())
+    .map_err(|e| UsageError(e.to_string()))?;
     if let Some(preset) = cli.preset.turbo() {
+        if cli
+            .evaluations
+            .is_some_and(|n| n as usize != preset.evaluations())
+            || cli.scheduler.as_deref().is_some_and(|s| s != "uniform")
+            || cli.video_shift.is_some_and(|s| s != 6.0)
+            || cli.audio_shift.is_some_and(|s| s != 3.0)
+        {
+            usage!(
+                "Turbo requires its trained evaluation count, uniform scheduling and shifts 6/3"
+            );
+        }
         for (name, given, expected) in [
             ("width", cli.width, 1344),
             ("height", cli.height, 768),
@@ -544,7 +642,11 @@ fn run(mut cli: Cli) -> Result<()> {
             if cli.last_frame.is_some()
                 || !cli.files.is_empty()
                 || !cli.refmods.is_empty()
+                || cli.attention_pattern != "dense"
                 || cli.preset != Preset::Base
+                || cli.scheduler.as_deref().is_some_and(|s| s != "uniform")
+                || cli.video_shift.is_some_and(|s| s != 12.0)
+                || cli.audio_shift.is_some_and(|s| s != 3.0)
                 || !cli.loras.is_empty()
                 || !cli.lora_strength.is_empty()
                 || cache_policy(&cli)? != h3_hrx::CachePolicy::Off
@@ -555,7 +657,11 @@ fn run(mut cli: Cli) -> Result<()> {
             cli.width = Some(cli.width.unwrap_or(832));
             cli.height = Some(cli.height.unwrap_or(480));
             cli.frames = Some(cli.frames.unwrap_or(124));
-            cli.steps = Some(cli.steps.unwrap_or(51));
+            cli.steps = Some(
+                cli.steps
+                    .unwrap_or_else(|| cli.evaluations.map_or(51, |n| n + 1)),
+            );
+            cli.evaluations = None;
             cli.sampler = Some(Sampler::Euler);
             cli.attn = Attn::F16;
             cli.refmod_presentation = Some(RefmodPresentation::Upstream);
@@ -940,6 +1046,7 @@ fn run(mut cli: Cli) -> Result<()> {
         loom_library,
         compiler: cli.runtime.compiler(),
         weight_io: cli.runtime.weight_io(),
+        attention_pattern: attention_pattern(&cli)?,
         attention: match cli.attn {
             Attn::F16 => Attn16::F16,
             Attn::I8 => Attn16::I8,
@@ -1587,5 +1694,104 @@ mod upscale_options {
         assert_eq!(cli.upscale_steps, 4);
         assert_eq!(cli.upscale_denoise, 0.4);
         assert!(!cli.upscale_no_chunking);
+    }
+}
+
+#[cfg(test)]
+mod sampling_options {
+    use super::*;
+    #[test]
+    fn fasth3_is_explicit_and_overrides_are_respected() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap();
+        assert!(parameters(&parse(&["h3", "--preset", "fasth3"])).is_err());
+        let p = parameters(&parse(&["h3", "--preset", "fasth3", "--dit", "b6"])).unwrap();
+        assert_eq!((p.steps, p.video_shift, p.audio_shift), (11, 10.0, 3.0));
+        assert_eq!(p.scheduler, h3_hrx::Scheduler::Simple);
+        let p = parameters(&parse(&[
+            "h3",
+            "--preset",
+            "fasth3",
+            "--dit",
+            "b6",
+            "--evaluations",
+            "12",
+            "--sampler",
+            "euler",
+            "--video-shift",
+            "12",
+        ]))
+        .unwrap();
+        assert_eq!(
+            (p.steps, p.video_shift, p.sampler),
+            (13, 12.0, Sampler16::Euler)
+        );
+        assert!(Cli::try_parse_from(["h3", "--steps", "12", "--evaluations", "12"]).is_err());
+        assert!(parameters(&parse(&["h3", "--video-shift", "NaN"])).is_err());
+        let p = parameters(&parse(&["h3", "--steps", "12"])).unwrap();
+        assert_eq!((p.steps, p.scheduler), (12, h3_hrx::Scheduler::Uniform));
+    }
+}
+
+#[cfg(test)]
+mod vsa_options {
+    use super::*;
+    #[test]
+    fn sparse_settings_fail_early_and_are_independent_of_precision() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap();
+        for args in [
+            vec!["h3", "--attention-pattern", "vsa", "--attn", "i4"],
+            vec!["h3", "--vsa-keep-percent", "10"],
+            vec![
+                "h3",
+                "--attention-pattern",
+                "vsa",
+                "--vsa-start",
+                "0.9",
+                "--vsa-end",
+                "0.2",
+            ],
+            vec![
+                "h3",
+                "--attention-pattern",
+                "vsa",
+                "--vsa-dense-blocks",
+                "50",
+            ],
+            vec![
+                "h3",
+                "--attention-pattern",
+                "vsa",
+                "--vsa-keep-percent",
+                "NaN",
+            ],
+            vec![
+                "h3",
+                "--attention-pattern",
+                "vsa",
+                "--preset",
+                "turbo-768p-4",
+            ],
+        ] {
+            assert!(parameters(&parse(&args)).is_err());
+        }
+        let cli = parse(&[
+            "h3",
+            "--attention-pattern",
+            "vsa",
+            "--attn",
+            "f16",
+            "--vsa-min-tokens",
+            "0",
+            "--vsa-dense-blocks",
+            "0,49",
+        ]);
+        let h3_hrx::AttentionPattern::Vsa(o) = attention_pattern(&cli).unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            (o.keep_percent, o.start, o.end, o.min_tokens),
+            (10.0, 0.2, 1.0, 0)
+        );
+        assert_eq!(o.dense_blocks, vec![0, 49]);
     }
 }

@@ -52,3 +52,32 @@ the worker lives. Rustler is confined to this adapter.
 
 [Rustler resources](https://docs.rs/rustler/0.38.0/rustler/struct.ResourceArc.html) ·
 [NIF scheduling](https://docs.rs/rustler/0.38.0/rustler/attr.nif.html)
+
+## Explicit FastH3 sampling
+
+`open_with_options/1` accepts an atom-keyed map. Omitted keys keep defaults:
+`dit`, `te`, `video_vae`, `audio_vae` (path strings), and `attention`
+(`"f16"`, `"i8"`, or `"i4"`). Unknown keys are rejected.
+
+`generate_with_options/4` accepts `(model, request, options, id)`, retaining the
+existing request and result formats. Options include `preset: "fasth3"`,
+`evaluations: 10`, `scheduler: "simple"`, `sampler: "res_multistep"` or `"euler"`,
+`video_shift: 10.0`, `audio_shift: 3.0`, and `bypass_upscale: true`.
+The FastH3 preset requires a model opened with an explicit `dit` path.
+Explicit options override the preset. `steps` in options is a legacy sigma-point
+count and conflicts with `evaluations`; either overrides the request's `steps`.
+With neither option nor preset, the request's `steps` is retained.
+Bypassing upscaling also bypasses refinement and validation of upscale fields.
+The original `open/1` and `generate/3` remain unchanged.
+
+```elixir
+model = H3.Native.open_with_options(%{dit: Path.expand("~/h3_b6_int8.safetensors")})
+:ok = H3.Native.generate_with_options(model, request,
+  %{preset: "fasth3", evaluations: 12, bypass_upscale: true}, 44)
+```
+
+`open_with_options/1` also accepts `attention_pattern: "vsa"`,
+`vsa_keep_percent`, `vsa_start`, `vsa_end`, `vsa_min_tokens`, and
+`vsa_dense_blocks` (a list of zero-based global DiT indices). Defaults match the
+CLI. VSA options require `attention_pattern: "vsa"`; VSA rejects `attention: "i4"`.
+These are session options; sampling options belong to `generate_with_options/4`.

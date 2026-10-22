@@ -60,6 +60,8 @@ pub struct Config {
     pub compiler: crate::compile::Options,
     /// the DiT attention's QK operands
     pub attention: crate::dit::Attention,
+    /// Dense or video cube sparsity, independent of QK precision.
+    pub attention_pattern: crate::AttentionPattern,
     /// Explicit checkpoint loading route; mapped loading remains the default.
     pub weight_io: crate::weights::WeightIo,
 }
@@ -80,6 +82,7 @@ impl Default for Config {
             loom_library: None,
             compiler: Default::default(),
             attention: crate::dit::Attention::default(),
+            attention_pattern: Default::default(),
             weight_io: Default::default(),
         }
     }
@@ -170,6 +173,7 @@ impl Session {
     /// The checkpoint immutability requirements of [`Session::new`] apply for the
     /// entire session, including files temporarily released and reopened later.
     pub unsafe fn new_with_options(config: Config, options: SessionOptions) -> Result<Self> {
+        config.attention_pattern.validate(config.attention)?;
         let context = hrx::inference::ModelContext::new(hrx::execution::RuntimeOptions {
             native_lifetime: config.weight_io.native_lifetime(),
             ..Default::default()
@@ -193,6 +197,13 @@ impl Session {
         options: SessionOptions,
         context: &hrx::inference::ModelContext,
     ) -> Result<Self> {
+        config.attention_pattern.validate(config.attention)?;
+        if matches!(config.attention_pattern, crate::AttentionPattern::Vsa(_))
+            && (options.turbo.is_some()
+                || matches!(options.cache, crate::CachePolicy::Conservative(_)))
+        {
+            return invalid("VSA requires Turbo off and residual cache reuse off");
+        }
         if config.weight_io.mode != crate::weights::WeightIoMode::Mapped
             && context.runtime().native_lifetime() != hrx::fabric::NativeLifetime::Process
         {
@@ -377,6 +388,7 @@ impl Session {
         if first_frame.frame_index != 0
             || first_frame.audio.is_some()
             || p.frames as usize != world.frames
+            || p.scheduler != crate::Scheduler::Uniform
             || p.sampler != crate::Sampler::Euler
             || p.cache_threshold != 0.0
         {
@@ -393,7 +405,9 @@ impl Session {
             return invalid("world sequence exceeds the native attention limit of 65536 rows");
         }
         self.scheduled(|state| {
-            if state.options.turbo.is_some()
+            if state.config.attention_pattern != crate::AttentionPattern::Dense
+                || p.scheduler != crate::Scheduler::Uniform
+                || state.options.turbo.is_some()
                 || state.options.cache != crate::CachePolicy::Off
                 || state.config.loras.len() != 1
                 || state.config.loras[0].strength != 1.0
@@ -411,7 +425,8 @@ impl Session {
 
     pub(crate) fn world_adapter_identity(&self) -> Result<String> {
         let state = self.native.state()?;
-        if state.options.turbo.is_some()
+        if state.config.attention_pattern != crate::AttentionPattern::Dense
+            || state.options.turbo.is_some()
             || state.options.cache != crate::CachePolicy::Off
             || state.config.loras.len() != 1
             || state.config.loras[0].strength != 1.0
@@ -766,6 +781,7 @@ impl State {
             };
             let mut dit = unsafe { Dit::open(&mut self.stream, &path) }?;
             dit.set_weight_io(self.config.weight_io, &self.compiler)?;
+            dit.set_attention_pattern(self.config.attention_pattern.clone());
             if let Some(adapter) = adapter {
                 dit.set_adapter(adapter);
             }
@@ -984,6 +1000,7 @@ impl State {
                 );
             }
             if p.steps != preset.evaluations() + 1
+                || p.scheduler != crate::Scheduler::Uniform
                 || p.sampler != crate::Sampler::Euler
                 || p.video_shift != 6.0
                 || p.audio_shift != 3.0
@@ -1009,6 +1026,21 @@ impl State {
                 p.height, p.width, p.frames
             ));
         };
+        crate::sampling::validate(p)?;
+        self.config
+            .attention_pattern
+            .validate(self.config.attention)?;
+        if matches!(
+            self.config.attention_pattern,
+            crate::AttentionPattern::Vsa(_)
+        ) && (self.options.turbo.is_some()
+            || p.cache_threshold > 0.0
+            || matches!(self.options.cache, crate::CachePolicy::Conservative(_)))
+        {
+            return invalid(
+                "VSA requires Turbo off and residual cache reuse off (observe is allowed)",
+            );
+        }
         if !(2..=1000).contains(&p.steps) {
             return invalid(format!("steps must be 2..1000, not {}", p.steps));
         }
@@ -1563,6 +1595,7 @@ mod tests {
             loom_library: None,
             compiler: Default::default(),
             attention,
+            attention_pattern: Default::default(),
         }
     }
 

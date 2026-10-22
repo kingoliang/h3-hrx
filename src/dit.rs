@@ -102,6 +102,11 @@ pub struct Dit {
     block_graph: Option<hrx::GraphExec>,
     /// Blocks 1..49, replayed only when the host step cache misses.
     suffix_graph: Option<hrx::GraphExec>,
+    sparse_graph: Option<hrx::GraphExec>,
+    sparse_suffix_graph: Option<hrx::GraphExec>,
+    attention_pattern: crate::AttentionPattern,
+    vsa: Option<std::sync::Arc<crate::vsa::device::Runtime>>,
+    vsa_active: bool,
     cache: Option<CacheBuffers>,
     euler: Option<crate::sampler::device::Euler>,
     multistep: Option<crate::sampler::resident::Multistep>,
@@ -142,10 +147,19 @@ impl Dit {
             blocks: None,
             block_graph: None,
             suffix_graph: None,
+            sparse_graph: None,
+            sparse_suffix_graph: None,
+            attention_pattern: Default::default(),
+            vsa: None,
+            vsa_active: false,
             cache: None,
             euler: None,
             multistep: None,
         })
+    }
+
+    pub(crate) fn set_attention_pattern(&mut self, pattern: crate::AttentionPattern) {
+        self.attention_pattern = pattern;
     }
 
     pub(crate) fn set_adapter(&mut self, adapter: crate::adapter::Adapter) {
@@ -176,6 +190,8 @@ impl Dit {
         }
         self.block_graph = None;
         self.suffix_graph = None;
+        self.sparse_graph = None;
+        self.sparse_suffix_graph = None;
         self.seq = None;
         let t = seq_capacity(seq);
         let zeroed = |bytes: usize| -> Result<hrx::Buffer> {
@@ -212,6 +228,7 @@ impl Dit {
             true,
             self.constants.ones.clone(),
             "refiner",
+            false,
         )?;
         if let Some(adapter) = &self.adapter {
             stack.attach_adapter(c, stream, adapter, true)?;
@@ -372,9 +389,11 @@ pub struct DenoiseParams {
     pub height: i32,
     pub width: i32,
     pub frames: i32,
+    /// Sigma points: normally one more than the number of model evaluations.
     pub steps: usize,
     pub seed: u64,
     pub sampler: Sampler,
+    pub scheduler: crate::sampling::Scheduler,
     pub video_shift: f64,
     pub audio_shift: f64,
     pub cache_threshold: f32,
@@ -389,6 +408,7 @@ impl Default for DenoiseParams {
             steps: 30,
             seed: 0,
             sampler: Sampler::ResMultistep,
+            scheduler: Default::default(),
             video_shift: 12.0,
             audio_shift: 3.0,
             cache_threshold: 0.0,
@@ -740,6 +760,8 @@ impl Dit {
         }
         self.block_graph = None;
         self.suffix_graph = None;
+        self.sparse_graph = None;
+        self.sparse_suffix_graph = None;
         self.blocks = None;
         let d = StackDims {
             hidden: HID,
@@ -770,6 +792,7 @@ impl Dit {
             true,
             self.constants.ones.clone(),
             "dit",
+            matches!(self.attention_pattern, crate::AttentionPattern::Vsa(_)),
         )?;
         if let Some(adapter) = &self.adapter {
             stack.attach_adapter(c, stream, adapter, false)?;
@@ -1031,6 +1054,43 @@ impl Dit {
             qk_bits
         };
         self.ensure_blocks(stream, c, s, lr, qk_bits)?;
+        if let crate::AttentionPattern::Vsa(options) = &self.attention_pattern {
+            if self.world_codes.is_some()
+                || p.cache_threshold > 0.0
+                || matches!(cache_policy, crate::CachePolicy::Conservative(_))
+            {
+                return invalid("VSA does not support World or residual cache reuse");
+            }
+            options.validate()?;
+            if qk_bits == 4 {
+                return invalid("VSA requires f16 or i8 attention");
+            }
+            let plan = crate::vsa::Plan::new(&lay);
+            // Reset recordings and state on each request. No routing/statistics escape
+            // cancellation, changes of layout, or model eviction.
+            self.block_graph = None;
+            self.suffix_graph = None;
+            self.sparse_graph = None;
+            self.sparse_suffix_graph = None;
+            self.vsa_active = false;
+            if self.vsa.as_ref().is_none_or(|v| v.plan != plan) {
+                self.blocks
+                    .as_mut()
+                    .expect("built")
+                    .stack
+                    .set_vsa(None, None);
+                self.vsa = None;
+                self.vsa = Some(std::sync::Arc::new(crate::vsa::device::Runtime::new(
+                    c, stream, plan, options, HEADS, qk_bits, BLOCKS,
+                )?));
+            }
+            self.vsa.as_ref().unwrap().reset(stream)?;
+            self.blocks
+                .as_mut()
+                .expect("built")
+                .stack
+                .set_vsa(self.vsa.clone(), Some(options));
+        }
         // Graphs own the old routing buffers. Drop them before replacing routing, including
         // when returning to ordinary generation. Leave ordinary graph reuse untouched.
         if self.world_codes.is_some()
@@ -1043,12 +1103,26 @@ impl Dit {
         {
             self.block_graph = None;
             self.suffix_graph = None;
+            self.sparse_graph = None;
+            self.sparse_suffix_graph = None;
             self.blocks.as_mut().expect("built").stack.world_routing(
                 c,
                 stream,
                 self.world_codes.as_deref(),
             )?;
         }
+        crate::trace::event("attention_options", || {
+            let options = match &self.attention_pattern {
+                crate::AttentionPattern::Dense => serde_json::json!({"pattern":"dense"}),
+                crate::AttentionPattern::Vsa(o) => {
+                    serde_json::json!({"pattern":"vsa", "keep_percent":o.keep_percent,"start":o.start,"end":o.end,"min_tokens":o.min_tokens,"dense_blocks":o.dense_blocks,"block_size":64,"cube":[4,4,4]})
+                }
+            };
+            format!(
+                ",\"options\":{options},\"precision_bits\":{qk_bits},\"compression_gates\":{}",
+                self.blocks.as_ref().expect("built").stack.vsa_gate_count()
+            )
+        });
         crate::trace::event("sampling_loaded", || {
             format!(
             ",\"text_rows\":{},\"reference_rows\":{},\"audio_rows\":{},\"video_rows\":{},\"total_rows\":{},\"sequence_capacity\":{},\"attention_capacity\":{},\"prefix_copy_bytes\":{},\"qk_bits\":{}",
@@ -1068,18 +1142,8 @@ impl Dit {
         let res = refinement.is_some() || p.sampler == Sampler::ResMultistep;
         let host_sampler = refinement.is_some();
         let resident_multistep = res && !host_sampler;
-        let (shift_v, shift_a) = (
-            if p.video_shift > 0.0 {
-                p.video_shift
-            } else {
-                12.0
-            },
-            if p.audio_shift > 0.0 {
-                p.audio_shift
-            } else {
-                3.0
-            },
-        );
+        crate::sampling::validate(p)?;
+        let (shift_v, shift_a) = (p.video_shift, p.audio_shift);
         let ascale = shift_v / shift_a;
 
         let mut rng = crate::noise::Noise::new(p.seed);
@@ -1099,7 +1163,7 @@ impl Dit {
         }
         let mut sv = match refinement {
             Some((_, settings)) => settings.schedule()?,
-            None => crate::layout::Schedule::new(p.steps, shift_v),
+            None => p.scheduler.schedule(p.steps, shift_v),
         };
         if refinement.is_some() && sv.sigmas[0] >= 1.0 {
             let base = 1.0 - 1e-4;
@@ -1126,7 +1190,7 @@ impl Dit {
                 timesteps: vec![1.0; sv.timesteps.len()],
             }
         } else {
-            crate::layout::Schedule::new(p.steps, shift_a)
+            p.scheduler.audio_schedule(p.steps, shift_v, shift_a)
         };
         if let Some((initial, _)) = refinement {
             let mut clean = vec![0.0; vrows.len()];
@@ -1184,8 +1248,8 @@ impl Dit {
                 }
             };
             format!(
-                ",\"evaluations\":{},\"video_sigmas\":{:?},\"audio_sigmas\":{:?},\"seed\":{},\"sampler\":\"{}\",\"cache_mode\":\"{mode}\",\"cache_thresholds\":{:?}",
-                sv.timesteps.len(), sv.sigmas, sa.sigmas, p.seed, if refinement.is_some() { "ErSde" } else { match p.sampler {Sampler::Euler=>"Euler",Sampler::ResMultistep=>"ResMultistep"} }, thresholds,
+                ",\"evaluations\":{},\"video_sigmas\":{:?},\"audio_sigmas\":{:?},\"seed\":{},\"sampler\":\"{}\",\"scheduler\":\"{:?}\",\"video_shift\":{},\"audio_shift\":{},\"cache_mode\":\"{mode}\",\"cache_thresholds\":{:?}",
+                sv.timesteps.len(), sv.sigmas, sa.sigmas, p.seed, if refinement.is_some() { "ErSde" } else { match p.sampler {Sampler::Euler=>"Euler",Sampler::ResMultistep=>"ResMultistep"} }, p.scheduler, shift_v, shift_a, thresholds,
             )
         });
         if sv.timesteps.len() != sa.timesteps.len() {
@@ -1209,6 +1273,30 @@ impl Dit {
 
         let mut step = 0;
         while step < sv.timesteps.len() {
+            if let crate::AttentionPattern::Vsa(options) = &self.attention_pattern {
+                let reason = if refinement.is_some() {
+                    Some("refinement")
+                } else if (0..BLOCKS).all(|b| options.dense_blocks.contains(&b)) {
+                    Some("excluded_blocks")
+                } else {
+                    options.dense_reason(s, sv.sigmas[step], shift_v)
+                };
+                let active = reason.is_none();
+                if active != self.vsa_active {
+                    std::mem::swap(&mut self.block_graph, &mut self.sparse_graph);
+                    std::mem::swap(&mut self.suffix_graph, &mut self.sparse_suffix_graph);
+                    self.vsa_active = active;
+                }
+                self.blocks
+                    .as_mut()
+                    .expect("built")
+                    .stack
+                    .vsa_active(active);
+                crate::trace::event("attention_pattern", || {
+                    format!(",\"step\":{step},\"pattern\":\"{}\",\"dense_reason\":\"{}\",\"sparse_blocks\":{}", if active {"vsa"} else {"dense"}, reason.unwrap_or(""), if active {(0..BLOCKS).filter(|b|!options.dense_blocks.contains(b)).count()} else {0})
+                });
+            }
+
             // the four timestep embeddings: video, audio, and the two conditioning classes, which
             // sit at least at the augmentation timestep so a reference never reads as fully denoised
             let tv = crate::conditioning::temb(&curve, sv.timesteps[step]);
@@ -1815,6 +1903,11 @@ mod tests {
             blocks: None,
             block_graph: None,
             suffix_graph: None,
+            sparse_graph: None,
+            sparse_suffix_graph: None,
+            attention_pattern: Default::default(),
+            vsa: None,
+            vsa_active: false,
             cache: None,
             euler: None,
             multistep: None,
@@ -1919,3 +2012,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, feature = "gpu-tests"))]
+mod qualification;
